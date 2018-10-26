@@ -722,7 +722,7 @@ or the `CONSUL_HTTP_TOKEN` environment variable.
 #### ACL Rules
 
 The `acl` resource controls access to ACL operations in the
-[ACL API](/api/operator/acl.html).
+[ACL API](/api/acl.html).
 
 ACL rules look like this:
 

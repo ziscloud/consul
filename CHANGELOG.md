@@ -33,6 +33,13 @@ IMPROVEMENTS:
 * dns: Implement prefix lookups for DNS TTL. [[GH-4605](https://github.com/hashicorp/consul/issues/4605)]
 * ui: Add JSON and YAML linting to the KV code editor [[GH-4814](https://github.com/hashicorp/consul/pull/4814)]
 
+## 1.3.1 (November 13, 2018)
+
+BUG FIXES:
+ * api: Fix issue introduced in 1.3.0 where catalog queries with tag filters
+   change behaviour during upgrades from 1.2.x or earlier. (Back-ported from
+   1.4.0 release candidate.) [[GH-4944](https://github.com/hashicorp/consul/issues/4944)].
+
 ## 1.3.0 (October 11, 2018)
 
 FEATURES:

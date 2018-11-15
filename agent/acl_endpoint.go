@@ -102,6 +102,18 @@ func (s *HTTPServer) ACLRulesTranslate(resp http.ResponseWriter, req *http.Reque
 		return nil, nil
 	}
 
+	var token string
+	s.parseToken(req, &token)
+	rule, err := s.agent.resolveToken(token)
+	if err != nil {
+		return nil, err
+	}
+	// Should this require lesser permissions? Really the only reason to require authorization at all is
+	// to prevent external entities from DoS Consul with repeated rule translation requests
+	if rule != nil && !rule.ACLRead() {
+		return nil, acl.ErrPermissionDenied
+	}
+
 	policyBytes, err := ioutil.ReadAll(req.Body)
 	if err != nil {
 		return nil, BadRequestError{Reason: fmt.Sprintf("Failed to read body: %v", err)}
@@ -126,7 +138,7 @@ func (s *HTTPServer) ACLRulesTranslateLegacyToken(resp http.ResponseWriter, req 
 		return nil, BadRequestError{Reason: "Missing token ID"}
 	}
 
-	args := structs.ACLTokenReadRequest{
+	args := structs.ACLTokenGetRequest{
 		Datacenter:  s.agent.config.Datacenter,
 		TokenID:     tokenID,
 		TokenIDType: structs.ACLTokenAccessor,
@@ -223,7 +235,7 @@ func (s *HTTPServer) ACLPolicyCRUD(resp http.ResponseWriter, req *http.Request) 
 }
 
 func (s *HTTPServer) ACLPolicyRead(resp http.ResponseWriter, req *http.Request, policyID string) (interface{}, error) {
-	args := structs.ACLPolicyReadRequest{
+	args := structs.ACLPolicyGetRequest{
 		Datacenter: s.agent.config.Datacenter,
 		PolicyID:   policyID,
 	}
@@ -257,7 +269,7 @@ func (s *HTTPServer) ACLPolicyCreate(resp http.ResponseWriter, req *http.Request
 }
 
 // fixCreateTimeAndHash is used to help in decoding the CreateTime and Hash
-// attributes from the ACL Token create/update requests. It is needed
+// attributes from the ACL Token/Policy create/update requests. It is needed
 // to help mapstructure decode things properly when decodeBody is used.
 func fixCreateTimeAndHash(raw interface{}) error {
 	rawMap, ok := raw.(map[string]interface{})
@@ -284,12 +296,12 @@ func fixCreateTimeAndHash(raw interface{}) error {
 }
 
 func (s *HTTPServer) ACLPolicyWrite(resp http.ResponseWriter, req *http.Request, policyID string) (interface{}, error) {
-	args := structs.ACLPolicyUpsertRequest{
+	args := structs.ACLPolicySetRequest{
 		Datacenter: s.agent.config.Datacenter,
 	}
 	s.parseToken(req, &args.Token)
 
-	if err := decodeBody(req, &args.Policy, nil); err != nil {
+	if err := decodeBody(req, &args.Policy, fixCreateTimeAndHash); err != nil {
 		return nil, BadRequestError{Reason: fmt.Sprintf("Policy decoding failed: %v", err)}
 	}
 
@@ -302,7 +314,7 @@ func (s *HTTPServer) ACLPolicyWrite(resp http.ResponseWriter, req *http.Request,
 	}
 
 	var out structs.ACLPolicy
-	if err := s.agent.RPC("ACL.PolicyUpsert", args, &out); err != nil {
+	if err := s.agent.RPC("ACL.PolicySet", args, &out); err != nil {
 		return nil, err
 	}
 
@@ -361,10 +373,10 @@ func (s *HTTPServer) ACLTokenCRUD(resp http.ResponseWriter, req *http.Request) (
 
 	switch req.Method {
 	case "GET":
-		fn = s.ACLTokenRead
+		fn = s.ACLTokenGet
 
 	case "PUT":
-		fn = s.ACLTokenWrite
+		fn = s.ACLTokenSet
 
 	case "DELETE":
 		fn = s.ACLTokenDelete
@@ -390,7 +402,7 @@ func (s *HTTPServer) ACLTokenSelf(resp http.ResponseWriter, req *http.Request) (
 		return nil, nil
 	}
 
-	args := structs.ACLTokenReadRequest{
+	args := structs.ACLTokenGetRequest{
 		TokenIDType: structs.ACLTokenSecret,
 	}
 
@@ -423,11 +435,11 @@ func (s *HTTPServer) ACLTokenCreate(resp http.ResponseWriter, req *http.Request)
 		return nil, nil
 	}
 
-	return s.ACLTokenWrite(resp, req, "")
+	return s.ACLTokenSet(resp, req, "")
 }
 
-func (s *HTTPServer) ACLTokenRead(resp http.ResponseWriter, req *http.Request, tokenID string) (interface{}, error) {
-	args := structs.ACLTokenReadRequest{
+func (s *HTTPServer) ACLTokenGet(resp http.ResponseWriter, req *http.Request, tokenID string) (interface{}, error) {
+	args := structs.ACLTokenGetRequest{
 		Datacenter:  s.agent.config.Datacenter,
 		TokenID:     tokenID,
 		TokenIDType: structs.ACLTokenAccessor,
@@ -454,8 +466,8 @@ func (s *HTTPServer) ACLTokenRead(resp http.ResponseWriter, req *http.Request, t
 	return out.Token, nil
 }
 
-func (s *HTTPServer) ACLTokenWrite(resp http.ResponseWriter, req *http.Request, tokenID string) (interface{}, error) {
-	args := structs.ACLTokenUpsertRequest{
+func (s *HTTPServer) ACLTokenSet(resp http.ResponseWriter, req *http.Request, tokenID string) (interface{}, error) {
+	args := structs.ACLTokenSetRequest{
 		Datacenter: s.agent.config.Datacenter,
 	}
 	s.parseToken(req, &args.Token)
@@ -471,7 +483,7 @@ func (s *HTTPServer) ACLTokenWrite(resp http.ResponseWriter, req *http.Request, 
 	}
 
 	var out structs.ACLToken
-	if err := s.agent.RPC("ACL.TokenUpsert", args, &out); err != nil {
+	if err := s.agent.RPC("ACL.TokenSet", args, &out); err != nil {
 		return nil, err
 	}
 
@@ -497,7 +509,7 @@ func (s *HTTPServer) ACLTokenClone(resp http.ResponseWriter, req *http.Request, 
 		return nil, nil
 	}
 
-	args := structs.ACLTokenUpsertRequest{
+	args := structs.ACLTokenSetRequest{
 		Datacenter: s.agent.config.Datacenter,
 	}
 

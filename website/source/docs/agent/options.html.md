@@ -235,7 +235,7 @@ will exit with an error at startup.
   to an environment which communicates the HTTP port through the environment e.g. PaaS like CloudFoundry, allowing
   you to set the port directly via a Procfile.
 
-* <a name="_log_file"></a><a href="#_log_file">`-log-file`</a> - to redirect all the Consul agent log messages to a file. This can be specified with the complete path along with the name of the log. In case the path doesn't have the filename, the filename defaults to Consul-timestamp.log .  Can be combined with <a href="#_log_rotate_bytes"> -log-rotate-bytes</a> and <a href="#_log_rotate_duration"> -log-rotate-duration </a> for a fine-grained log rotation experience.
+* <a name="_log_file"></a><a href="#_log_file">`-log-file`</a> - to redirect all the Consul agent log messages to a file. This can be specified with the complete path along with the name of the log. In case the path doesn't have the filename, the filename defaults to `consul-{timestamp}.log`. Can be combined with <a href="#_log_rotate_bytes"> -log-rotate-bytes</a> and <a href="#_log_rotate_duration"> -log-rotate-duration </a> for a fine-grained log rotation experience.
 
 * <a name="_log_rotate_bytes"></a><a href="#_log_rotate_bytes">`-log-rotate-bytes`</a> - to specify the number of bytes that should be written to a log before it needs to be rotated. Unless specified, there is no limit to the number of bytes that can be written to a log file.
 
@@ -590,8 +590,10 @@ default will automatically work with some tooling.
         The ACL token used to authorize secondary datacenters with the primary datacenter for replication
         operations. This token is required for servers outside the [`primary_datacenter`](#primary_datacenter) when
         ACLs are enabled. This token may be provided later using the [agent token API](/api/agent.html#update-acl-tokens)
-        on each server. If the `replication` token is set in the config. This token must have at least "read" permissions
-        on ACL data but if ACL token replication is enabled then it must have "write" permissions.
+        on each server. This token must have at least "read" permissions on ACL data but if ACL 
+        token replication is enabled then it must have "write" permissions. This also enables 
+        Connect replication in Consul Enterprise, for which the token will require both operator 
+        "write" and intention "read" permissions for replicating CA and Intention data.
 
 * <a name="acl_datacenter"></a><a href="#acl_datacenter">`acl_datacenter`</a> - **This field is
   deprecated in Consul 1.4.0. See the [`primary_datacenter`](#primary_datacenter) field instead.**
@@ -864,8 +866,6 @@ default will automatically work with some tooling.
         * <a name="connect_proxy_allow_managed_root"></a><a href="#connect_proxy_allow_managed_root">`allow_managed_root`</a> [**Deprecated**](/docs/connect/proxies/managed-deprecated.html) Allows Consul to start managed proxies if Consul is running as root (EUID of the process is zero). We recommend running Consul as a non-root user. By default, this is false to protect inadvertently running external processes as root.
 
     * <a name="connect_proxy_defaults"></a><a href="#connect_proxy_defaults">`proxy_defaults`</a> [**Deprecated**](/docs/connect/proxies/managed-deprecated.html) This object configures the default proxy settings for service definitions with [managed proxies](/docs/connect/proxies/managed-deprecated.html) (now deprecated). It accepts the fields `exec_mode`, `daemon_command`, and `config`. These are used as default values for the respective fields in the service definition.
-
-    * <a name="replication_token"></a><a href="#replication_token">`replication_token`</a> When provided, this will enable Connect replication using this token to retrieve and replicate the Intentions to the non-authoritative local datacenter.
 
 * <a name="datacenter"></a><a href="#datacenter">`datacenter`</a> Equivalent to the
   [`-datacenter` command-line flag](#_datacenter).
@@ -1474,8 +1474,7 @@ default will automatically work with some tooling.
       (it might have an impact on Consul's memory usage). A good value for this parameter is at least 2 times the interval of scrape
       of Prometheus, but you might also put a very high retention time such as a few days (for instance 744h to enable retention
       to 31 days).
-      Fetching the metrics using prometheus can then be performed using the `/v1/agent/metrics?format=prometheus` URL or by sending
-      the Accept header with value `text/plain; version=0.0.4; charset=utf-8`  to the `/v1/agent/metrics` (as done by Prometheus).
+      Fetching the metrics using prometheus can then be performed using the [`/v1/agent/metrics?format=prometheus`](/api/agent.html#view-metrics) endpoint.
       The format is compatible natively with prometheus. When running in this mode, it is recommended to also enable the option
       <a href="#telemetry-disable_hostname">`disable_hostname`</a> to avoid having prefixed metrics with hostname.
       Consul does not use the default Prometheus path, so Prometheus must be configured as follows.

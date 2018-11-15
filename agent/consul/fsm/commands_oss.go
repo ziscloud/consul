@@ -23,10 +23,10 @@ func init() {
 	registerCommand(structs.AutopilotRequestType, (*FSM).applyAutopilotUpdate)
 	registerCommand(structs.IntentionRequestType, (*FSM).applyIntentionOperation)
 	registerCommand(structs.ConnectCARequestType, (*FSM).applyConnectCAOperation)
-	registerCommand(structs.ACLTokenUpsertRequestType, (*FSM).applyACLTokenUpsertOperation)
+	registerCommand(structs.ACLTokenSetRequestType, (*FSM).applyACLTokenSetOperation)
 	registerCommand(structs.ACLTokenDeleteRequestType, (*FSM).applyACLTokenDeleteOperation)
 	registerCommand(structs.ACLBootstrapRequestType, (*FSM).applyACLTokenBootstrap)
-	registerCommand(structs.ACLPolicyUpsertRequestType, (*FSM).applyACLPolicyUpsertOperation)
+	registerCommand(structs.ACLPolicySetRequestType, (*FSM).applyACLPolicySetOperation)
 	registerCommand(structs.ACLPolicyDeleteRequestType, (*FSM).applyACLPolicyDeleteOperation)
 }
 
@@ -158,7 +158,7 @@ func (c *FSM) applyACLOperation(buf []byte, index uint64) interface{} {
 		}
 		return enabled
 	case structs.ACLBootstrapNow:
-		// This a bootstrap request from a non-upgraded node
+		// This is a bootstrap request from a non-upgraded node
 		if err := c.state.ACLBootstrap(index, 0, req.ACL.Convert(), true); err != nil {
 			return err
 		}
@@ -179,7 +179,7 @@ func (c *FSM) applyACLOperation(buf []byte, index uint64) interface{} {
 		}
 		return req.ACL.ID
 	case structs.ACLDelete:
-		return c.state.ACLTokenDeleteSecret(index, req.ACL.ID)
+		return c.state.ACLTokenDeleteBySecret(index, req.ACL.ID)
 	default:
 		c.logger.Printf("[WARN] consul.fsm: Invalid ACL operation '%s'", req.Op)
 		return fmt.Errorf("Invalid ACL operation '%s'", req.Op)
@@ -339,11 +339,14 @@ func (c *FSM) applyConnectCAOperation(buf []byte, index uint64) interface{} {
 		if err != nil {
 			return err
 		}
-
-		if err := c.state.CASetConfig(index+1, req.Config); err != nil {
-			return err
+		if !act {
+			return act
 		}
 
+		act, err = c.state.CACheckAndSetConfig(index+1, req.Config.ModifyIndex, req.Config)
+		if err != nil {
+			return err
+		}
 		return act
 	default:
 		c.logger.Printf("[WARN] consul.fsm: Invalid CA operation '%s'", req.Op)
@@ -351,15 +354,15 @@ func (c *FSM) applyConnectCAOperation(buf []byte, index uint64) interface{} {
 	}
 }
 
-func (c *FSM) applyACLTokenUpsertOperation(buf []byte, index uint64) interface{} {
-	var req structs.ACLTokenBatchUpsertRequest
+func (c *FSM) applyACLTokenSetOperation(buf []byte, index uint64) interface{} {
+	var req structs.ACLTokenBatchSetRequest
 	if err := structs.Decode(buf, &req); err != nil {
 		panic(fmt.Errorf("failed to decode request: %v", err))
 	}
 	defer metrics.MeasureSinceWithLabels([]string{"fsm", "acl", "token"}, time.Now(),
 		[]metrics.Label{{Name: "op", Value: "upsert"}})
 
-	return c.state.ACLTokensUpsert(index, req.Tokens, req.AllowCreate)
+	return c.state.ACLTokenBatchSet(index, req.Tokens, req.CAS)
 }
 
 func (c *FSM) applyACLTokenDeleteOperation(buf []byte, index uint64) interface{} {
@@ -370,7 +373,7 @@ func (c *FSM) applyACLTokenDeleteOperation(buf []byte, index uint64) interface{}
 	defer metrics.MeasureSinceWithLabels([]string{"fsm", "acl", "token"}, time.Now(),
 		[]metrics.Label{{Name: "op", Value: "delete"}})
 
-	return c.state.ACLTokensDelete(index, req.TokenIDs)
+	return c.state.ACLTokenBatchDelete(index, req.TokenIDs)
 }
 
 func (c *FSM) applyACLTokenBootstrap(buf []byte, index uint64) interface{} {
@@ -383,15 +386,15 @@ func (c *FSM) applyACLTokenBootstrap(buf []byte, index uint64) interface{} {
 	return c.state.ACLBootstrap(index, req.ResetIndex, &req.Token, false)
 }
 
-func (c *FSM) applyACLPolicyUpsertOperation(buf []byte, index uint64) interface{} {
-	var req structs.ACLPolicyBatchUpsertRequest
+func (c *FSM) applyACLPolicySetOperation(buf []byte, index uint64) interface{} {
+	var req structs.ACLPolicyBatchSetRequest
 	if err := structs.Decode(buf, &req); err != nil {
 		panic(fmt.Errorf("failed to decode request: %v", err))
 	}
 	defer metrics.MeasureSinceWithLabels([]string{"fsm", "acl", "policy"}, time.Now(),
 		[]metrics.Label{{Name: "op", Value: "upsert"}})
 
-	return c.state.ACLPoliciesUpsert(index, req.Policies)
+	return c.state.ACLPolicyBatchSet(index, req.Policies)
 }
 
 func (c *FSM) applyACLPolicyDeleteOperation(buf []byte, index uint64) interface{} {
@@ -402,5 +405,5 @@ func (c *FSM) applyACLPolicyDeleteOperation(buf []byte, index uint64) interface{
 	defer metrics.MeasureSinceWithLabels([]string{"fsm", "acl", "policy"}, time.Now(),
 		[]metrics.Label{{Name: "op", Value: "delete"}})
 
-	return c.state.ACLPoliciesDelete(index, req.PolicyIDs)
+	return c.state.ACLPolicyBatchDelete(index, req.PolicyIDs)
 }

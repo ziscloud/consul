@@ -105,11 +105,11 @@ func (s *Server) updateLocalACLPolicies(policies structs.ACLPolicies, ctx contex
 			batchSize += policies[batchEnd].EstimateSize()
 		}
 
-		req := structs.ACLPolicyBatchUpsertRequest{
+		req := structs.ACLPolicyBatchSetRequest{
 			Policies: policies[batchStart:batchEnd],
 		}
 
-		resp, err := s.raftApply(structs.ACLPolicyUpsertRequestType, &req)
+		resp, err := s.raftApply(structs.ACLPolicySetRequestType, &req)
 		if err != nil {
 			return false, fmt.Errorf("Failed to apply policy upserts: %v", err)
 		}
@@ -134,8 +134,8 @@ func (s *Server) updateLocalACLPolicies(policies structs.ACLPolicies, ctx contex
 	return false, nil
 }
 
-func (s *Server) fetchACLPoliciesBatch(policyIDs []string) (*structs.ACLPoliciesResponse, error) {
-	req := structs.ACLPolicyBatchReadRequest{
+func (s *Server) fetchACLPoliciesBatch(policyIDs []string) (*structs.ACLPolicyBatchResponse, error) {
+	req := structs.ACLPolicyBatchGetRequest{
 		Datacenter: s.config.ACLDatacenter,
 		PolicyIDs:  policyIDs,
 		QueryOptions: structs.QueryOptions{
@@ -144,7 +144,7 @@ func (s *Server) fetchACLPoliciesBatch(policyIDs []string) (*structs.ACLPolicies
 		},
 	}
 
-	var response structs.ACLPoliciesResponse
+	var response structs.ACLPolicyBatchResponse
 	if err := s.RPC("ACL.PolicyBatchRead", &req, &response); err != nil {
 		return nil, err
 	}
@@ -171,32 +171,49 @@ func (s *Server) fetchACLPolicies(lastRemoteIndex uint64) (*structs.ACLPolicyLis
 	return &response, nil
 }
 
-func diffACLTokens(local structs.ACLTokens, remote structs.ACLTokenListStubs, lastRemoteIndex uint64) ([]string, []string) {
+type tokenDiffResults struct {
+	LocalDeletes  []string
+	LocalUpserts  []string
+	LocalSkipped  int
+	RemoteSkipped int
+}
+
+func diffACLTokens(local structs.ACLTokens, remote structs.ACLTokenListStubs, lastRemoteIndex uint64) tokenDiffResults {
+	// Note: items with empty AccessorIDs will bubble up to the top.
 	local.Sort()
 	remote.Sort()
 
-	var deletions []string
-	var updates []string
+	var res tokenDiffResults
 	var localIdx int
 	var remoteIdx int
 	for localIdx, remoteIdx = 0, 0; localIdx < len(local) && remoteIdx < len(remote); {
+		if local[localIdx].AccessorID == "" {
+			res.LocalSkipped++
+			localIdx += 1
+			continue
+		}
+		if remote[remoteIdx].AccessorID == "" {
+			res.RemoteSkipped++
+			remoteIdx += 1
+			continue
+		}
 		if local[localIdx].AccessorID == remote[remoteIdx].AccessorID {
 			// policy is in both the local and remote state - need to check raft indices and Hash
 			if remote[remoteIdx].ModifyIndex > lastRemoteIndex && !bytes.Equal(remote[remoteIdx].Hash, local[localIdx].Hash) {
-				updates = append(updates, remote[remoteIdx].AccessorID)
+				res.LocalUpserts = append(res.LocalUpserts, remote[remoteIdx].AccessorID)
 			}
 			// increment both indices when equal
 			localIdx += 1
 			remoteIdx += 1
 		} else if local[localIdx].AccessorID < remote[remoteIdx].AccessorID {
 			// policy no longer in remoted state - needs deleting
-			deletions = append(deletions, local[localIdx].AccessorID)
+			res.LocalDeletes = append(res.LocalDeletes, local[localIdx].AccessorID)
 
 			// increment just the local index
 			localIdx += 1
 		} else {
 			// local state doesn't have this policy - needs updating
-			updates = append(updates, remote[remoteIdx].AccessorID)
+			res.LocalUpserts = append(res.LocalUpserts, remote[remoteIdx].AccessorID)
 
 			// increment just the remote index
 			remoteIdx += 1
@@ -204,14 +221,22 @@ func diffACLTokens(local structs.ACLTokens, remote structs.ACLTokenListStubs, la
 	}
 
 	for ; localIdx < len(local); localIdx += 1 {
-		deletions = append(deletions, local[localIdx].AccessorID)
+		if local[localIdx].AccessorID != "" {
+			res.LocalDeletes = append(res.LocalDeletes, local[localIdx].AccessorID)
+		} else {
+			res.LocalSkipped++
+		}
 	}
 
 	for ; remoteIdx < len(remote); remoteIdx += 1 {
-		updates = append(updates, remote[remoteIdx].AccessorID)
+		if remote[remoteIdx].AccessorID != "" {
+			res.LocalUpserts = append(res.LocalUpserts, remote[remoteIdx].AccessorID)
+		} else {
+			res.RemoteSkipped++
+		}
 	}
 
-	return deletions, updates
+	return res
 }
 
 func (s *Server) deleteLocalACLTokens(deletions []string, ctx context.Context) (bool, error) {
@@ -261,12 +286,12 @@ func (s *Server) updateLocalACLTokens(tokens structs.ACLTokens, ctx context.Cont
 			batchSize += tokens[batchEnd].EstimateSize()
 		}
 
-		req := structs.ACLTokenBatchUpsertRequest{
-			Tokens:      tokens[batchStart:batchEnd],
-			AllowCreate: true,
+		req := structs.ACLTokenBatchSetRequest{
+			Tokens: tokens[batchStart:batchEnd],
+			CAS:    false,
 		}
 
-		resp, err := s.raftApply(structs.ACLTokenUpsertRequestType, &req)
+		resp, err := s.raftApply(structs.ACLTokenSetRequestType, &req)
 		if err != nil {
 			return false, fmt.Errorf("Failed to apply token upserts: %v", err)
 		}
@@ -292,8 +317,8 @@ func (s *Server) updateLocalACLTokens(tokens structs.ACLTokens, ctx context.Cont
 	return false, nil
 }
 
-func (s *Server) fetchACLTokensBatch(tokenIDs []string) (*structs.ACLTokensResponse, error) {
-	req := structs.ACLTokenBatchReadRequest{
+func (s *Server) fetchACLTokensBatch(tokenIDs []string) (*structs.ACLTokenBatchResponse, error) {
+	req := structs.ACLTokenBatchGetRequest{
 		Datacenter:  s.config.ACLDatacenter,
 		AccessorIDs: tokenIDs,
 		QueryOptions: structs.QueryOptions{
@@ -302,7 +327,7 @@ func (s *Server) fetchACLTokensBatch(tokenIDs []string) (*structs.ACLTokensRespo
 		},
 	}
 
-	var response structs.ACLTokensResponse
+	var response structs.ACLTokenBatchResponse
 	if err := s.RPC("ACL.TokenBatchRead", &req, &response); err != nil {
 		return nil, err
 	}
@@ -354,7 +379,7 @@ func (s *Server) replicateACLPolicies(lastRemoteIndex uint64, ctx context.Contex
 	// replication process is.
 	defer metrics.MeasureSince([]string{"leader", "replication", "acl", "policy", "apply"}, time.Now())
 
-	_, local, err := s.fsm.State().ACLPolicyList(nil, "")
+	_, local, err := s.fsm.State().ACLPolicyList(nil)
 	if err != nil {
 		return 0, false, fmt.Errorf("failed to retrieve local ACL policies: %v", err)
 	}
@@ -374,7 +399,7 @@ func (s *Server) replicateACLPolicies(lastRemoteIndex uint64, ctx context.Contex
 
 	s.logger.Printf("[DEBUG] acl: policy replication - deletions: %d, updates: %d", len(deletions), len(updates))
 
-	var policies *structs.ACLPoliciesResponse
+	var policies *structs.ACLPolicyBatchResponse
 	if len(updates) > 0 {
 		policies, err = s.fetchACLPoliciesBatch(updates)
 		if err != nil {
@@ -453,12 +478,17 @@ func (s *Server) replicateACLTokens(lastRemoteIndex uint64, ctx context.Context)
 
 	// Calculate the changes required to bring the state into sync and then
 	// apply them.
-	deletions, updates := diffACLTokens(local, remote.Tokens, lastRemoteIndex)
-	s.logger.Printf("[DEBUG] acl: token replication - deletions: %d, updates: %d", len(deletions), len(updates))
+	res := diffACLTokens(local, remote.Tokens, lastRemoteIndex)
+	if res.LocalSkipped > 0 || res.RemoteSkipped > 0 {
+		s.logger.Printf("[DEBUG] acl: token replication - deletions: %d, updates: %d, skipped: %d, skippedRemote: %d",
+			len(res.LocalDeletes), len(res.LocalUpserts), res.LocalSkipped, res.RemoteSkipped)
+	} else {
+		s.logger.Printf("[DEBUG] acl: token replication - deletions: %d, updates: %d", len(res.LocalDeletes), len(res.LocalUpserts))
+	}
 
-	var tokens *structs.ACLTokensResponse
-	if len(updates) > 0 {
-		tokens, err = s.fetchACLTokensBatch(updates)
+	var tokens *structs.ACLTokenBatchResponse
+	if len(res.LocalUpserts) > 0 {
+		tokens, err = s.fetchACLTokensBatch(res.LocalUpserts)
 		if err != nil {
 			return 0, false, fmt.Errorf("failed to retrieve ACL token updates: %v", err)
 		}
@@ -466,10 +496,10 @@ func (s *Server) replicateACLTokens(lastRemoteIndex uint64, ctx context.Context)
 		s.logger.Printf("[DEBUG] acl: token replication - downloaded %d tokens", len(tokens.Tokens))
 	}
 
-	if len(deletions) > 0 {
+	if len(res.LocalDeletes) > 0 {
 		s.logger.Printf("[DEBUG] acl: token replication - performing deletions")
 
-		exit, err := s.deleteLocalACLTokens(deletions, ctx)
+		exit, err := s.deleteLocalACLTokens(res.LocalDeletes, ctx)
 		if exit {
 			return 0, true, nil
 		}
@@ -479,7 +509,7 @@ func (s *Server) replicateACLTokens(lastRemoteIndex uint64, ctx context.Context)
 		s.logger.Printf("[DEBUG] acl: token replication - finished deletions")
 	}
 
-	if len(updates) > 0 {
+	if len(res.LocalUpserts) > 0 {
 		s.logger.Printf("[DEBUG] acl: token replication - performing updates")
 		exit, err := s.updateLocalACLTokens(tokens.Tokens, ctx)
 		if exit {

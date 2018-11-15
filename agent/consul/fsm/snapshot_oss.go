@@ -25,8 +25,8 @@ func init() {
 	registerRestorer(structs.ConnectCAProviderStateType, restoreConnectCAProviderState)
 	registerRestorer(structs.ConnectCAConfigType, restoreConnectCAConfig)
 	registerRestorer(structs.IndexRequestType, restoreIndex)
-	registerRestorer(structs.ACLTokenUpsertRequestType, restoreToken)
-	registerRestorer(structs.ACLPolicyUpsertRequestType, restorePolicy)
+	registerRestorer(structs.ACLTokenSetRequestType, restoreToken)
+	registerRestorer(structs.ACLPolicySetRequestType, restorePolicy)
 }
 
 func persistOSS(s *snapshot, sink raft.SnapshotSink, encoder *codec.Encoder) error {
@@ -82,7 +82,9 @@ func (s *snapshot) persistNodes(sink raft.SnapshotSink,
 	for node := nodes.Next(); node != nil; node = nodes.Next() {
 		n := node.(*structs.Node)
 		req := structs.RegisterRequest{
+			ID:              n.ID,
 			Node:            n.Node,
+			Datacenter:      n.Datacenter,
 			Address:         n.Address,
 			TaggedAddresses: n.TaggedAddresses,
 			NodeMeta:        n.Meta,
@@ -173,7 +175,7 @@ func (s *snapshot) persistACLs(sink raft.SnapshotSink,
 	}
 
 	for token := tokens.Next(); token != nil; token = tokens.Next() {
-		if _, err := sink.Write([]byte{byte(structs.ACLTokenUpsertRequestType)}); err != nil {
+		if _, err := sink.Write([]byte{byte(structs.ACLTokenSetRequestType)}); err != nil {
 			return err
 		}
 		if err := encoder.Encode(token.(*structs.ACLToken)); err != nil {
@@ -187,7 +189,7 @@ func (s *snapshot) persistACLs(sink raft.SnapshotSink,
 	}
 
 	for policy := policies.Next(); policy != nil; policy = policies.Next() {
-		if _, err := sink.Write([]byte{byte(structs.ACLPolicyUpsertRequestType)}); err != nil {
+		if _, err := sink.Write([]byte{byte(structs.ACLPolicySetRequestType)}); err != nil {
 			return err
 		}
 		if err := encoder.Encode(policy.(*structs.ACLPolicy)); err != nil {
@@ -539,6 +541,15 @@ func restoreToken(header *snapshotHeader, restore *state.Restore, decoder *codec
 	if err := decoder.Decode(&req); err != nil {
 		return err
 	}
+
+	// DEPRECATED (ACL-Legacy-Compat)
+	if req.Rules != "" {
+		// When we restore a snapshot we may have to correct old HCL in legacy
+		// tokens to prevent the in-memory representation from using an older
+		// syntax.
+		structs.SanitizeLegacyACLToken(&req)
+	}
+
 	return restore.ACLToken(&req)
 }
 

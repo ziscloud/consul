@@ -9,7 +9,7 @@ import (
 )
 
 var serverACLCacheConfig *structs.ACLCachesConfig = &structs.ACLCachesConfig{
-	// The servers ACL caching has a few underlying assumptions:
+	// The server's ACL caching has a few underlying assumptions:
 	//
 	// 1 - All policies can be resolved locally. Hence we do not cache any
 	//     unparsed policies as we have memdb for that.
@@ -17,7 +17,7 @@ var serverACLCacheConfig *structs.ACLCachesConfig = &structs.ACLCachesConfig{
 	//     number of distinct policies and combined multi-policy authorizers
 	//     will be much less.
 	// 3 - If you need more than 10k tokens cached then you should probably
-	//     enabled token replication or be using DC local tokens. In both
+	//     enable token replication or be using DC local tokens. In both
 	//     cases resolving the tokens from memdb will avoid the cache
 	//     entirely
 	//
@@ -76,19 +76,19 @@ func (s *Server) canUpgradeToNewACLs(isLeader bool) bool {
 	}
 
 	if !s.InACLDatacenter() {
-		mode, _ := ServersGetACLMode(s.WANMembers(), "", s.config.ACLDatacenter)
-		if mode != structs.ACLModeEnabled {
+		numServers, mode, _ := ServersGetACLMode(s.WANMembers(), "", s.config.ACLDatacenter)
+		if mode != structs.ACLModeEnabled || numServers == 0 {
 			return false
 		}
 	}
 
 	if isLeader {
-		if mode, _ := ServersGetACLMode(s.LANMembers(), "", ""); mode == structs.ACLModeLegacy {
+		if _, mode, _ := ServersGetACLMode(s.LANMembers(), "", ""); mode == structs.ACLModeLegacy {
 			return true
 		}
 	} else {
 		leader := string(s.raft.Leader())
-		if _, leaderMode := ServersGetACLMode(s.LANMembers(), leader, ""); leaderMode == structs.ACLModeEnabled {
+		if _, _, leaderMode := ServersGetACLMode(s.LANMembers(), leader, ""); leaderMode == structs.ACLModeEnabled {
 			return true
 		}
 	}
@@ -97,7 +97,7 @@ func (s *Server) canUpgradeToNewACLs(isLeader bool) bool {
 }
 
 func (s *Server) InACLDatacenter() bool {
-	return s.config.Datacenter == s.config.ACLDatacenter
+	return s.config.ACLDatacenter == "" || s.config.Datacenter == s.config.ACLDatacenter
 }
 
 func (s *Server) UseLegacyACLs() bool {

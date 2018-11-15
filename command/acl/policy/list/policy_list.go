@@ -27,7 +27,7 @@ type cmd struct {
 func (c *cmd) init() {
 	c.flags = flag.NewFlagSet("", flag.ContinueOnError)
 	c.flags.BoolVar(&c.showMeta, "meta", false, "Indicates that policy metadata such "+
-		"as the content hash and raft indices should be show for each entry")
+		"as the content hash and raft indices should be shown for each entry")
 
 	c.http = &flags.HTTPFlags{}
 	flags.Merge(c.flags, c.http.ClientFlags())
@@ -67,11 +67,13 @@ func (c *cmd) Help() string {
 	return flags.Usage(c.help, nil)
 }
 
-const synopsis = "Delete an ACL Policy"
+const synopsis = "Lists ACL Policies"
 const help = `
 Usage: consul acl policy list [options]
 
     Lists all the ACL policies
 
-          $ consul acl policy list
+    Example:
+
+        $ consul acl policy list
 `

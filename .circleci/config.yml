@@ -31,6 +31,7 @@ jobs:
       - run:
           name: website deploy
           command: ./scripts/deploy.sh
+
 workflows:
   version: 2
   website:

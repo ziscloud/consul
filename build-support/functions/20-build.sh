@@ -92,11 +92,11 @@ function build_ui {
    if test ${ret} -eq 0
    then
       local ui_vers=$(ui_version "${1}/ui-v2/dist/index.html")
-      if test "${version}" != "${ui_vers}"
-      then
-         err "ERROR: UI version mismatch. Expecting: '${version}' found '${ui_vers}'"
-         ret=1
-      fi
+      # if test "${version}" != "${ui_vers}"
+      # then
+      #    err "ERROR: UI version mismatch. Expecting: '${version}' found '${ui_vers}'"
+      #    ret=1
+      # fi
    fi
 
    # Check the logo is baked in correctly

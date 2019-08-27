@@ -35,10 +35,10 @@ connection attempt.
 | `POST`  | `/agent/connect/authorize`  | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes),
-[agent caching](/api/index.html#agent-caching), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
 | Blocking Queries | Consistency Modes | Agent Caching        | ACL Required    |
 | ---------------- | ----------------- | -------------------- | --------------- |
@@ -102,10 +102,10 @@ unavailable. This endpoint should be used by proxies and native integrations.
 | `GET`  | `/agent/connect/ca/roots`    | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes),
-[agent caching](/api/index.html#agent-caching), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
 | Blocking Queries | Consistency Modes | Agent Caching        | ACL Required |
 | ---------------- | ----------------- | -------------------- | ------------ |
@@ -115,7 +115,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-   http://127.0.0.1:8500/v1/connect/ca/roots
+   http://127.0.0.1:8500/v1/agent/connect/ca/roots
 ```
 
 ### Sample Response
@@ -163,10 +163,10 @@ clients to efficiently wait for certificate rotations.
 | `GET`  | `/agent/connect/ca/leaf/:service`    | `application/json`         |
 
 The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes),
-[agent caching](/api/index.html#agent-caching), and
-[required ACLs](/api/index.html#acls).
+[blocking queries](/api/features/blocking.html),
+[consistency modes](/api/features/consistency.html),
+[agent caching](/api/features/caching.html), and
+[required ACLs](/api/index.html#authentication).
 
 | Blocking Queries | Consistency Modes | Agent Caching        | ACL Required    |
 | ---------------- | ----------------- | -------------------- | --------------- |
@@ -182,7 +182,7 @@ The table below shows this endpoint's support for
 
 ```text
 $ curl \
-   http://127.0.0.1:8500/v1/connect/ca/leaf/web
+   http://127.0.0.1:8500/v1/agent/connect/ca/leaf/web
 ```
 
 ### Sample Response
@@ -217,105 +217,3 @@ $ curl \
 
 - `ValidBefore` `(string)` - The time before which the certificate is valid.
   Used with `ValidAfter` this can determine the validity period of the certificate.
-
-## Managed Proxy Configuration ([Deprecated](/docs/connect/proxies/managed-deprecated.html))
-
-This endpoint returns the configuration for a [managed
-proxy](/docs/connect/proxies.html). Ths endpoint is only useful for _managed
-proxies_ and not relevant for unmanaged proxies. This endpoint will be removed
-in a future major release as part of [managed proxy
-deprecation].(/docs/connect/proxies/managed-deprecated.html). The equivalent API
-for use will all future proxies is the more generic `
-
-Managed proxy configuration is set in the service definition. When Consul
-starts the managed proxy, it provides the service ID and ACL token. The proxy
-is expected to call this endpoint to retrieve its configuration. It may use
-a blocking query to detect any configuration changes.
-
-| Method | Path                         | Produces                   |
-| ------ | ---------------------------- | -------------------------- |
-| `GET`  | `/agent/connect/proxy/:id`    | `application/json`        |
-
-The table below shows this endpoint's support for
-[blocking queries](/api/index.html#blocking-queries),
-[consistency modes](/api/index.html#consistency-modes),
-[agent caching](/api/index.html#agent-caching), and
-[required ACLs](/api/index.html#acls).
-
-| Blocking Queries | Consistency Modes | Agent Caching | ACL Required                 |
-| ---------------- | ----------------- | ------------- | ---------------------------- |
-| `YES`<sup>1</sup>| `all`             | `none`        | `service:write, proxy token` |
-
-<sup>1</sup> Supports [hash-based
-blocking](/api/index.html#hash-based-blocking-queries) only.
-
-### Parameters
-
-- `ID` `(string: <required>)` - The ID (not the name) of the proxy service
-  in the local agent catalog. For managed proxies, this is provided in the
-  `CONSUL_PROXY_ID` environment variable by Consul.
-
-### Sample Request
-
-```text
-$ curl \
-   http://127.0.0.1:8500/v1/connect/proxy/web-proxy
-```
-
-### Sample Response
-
-```json
-{
-  "ProxyServiceID": "web-proxy",
-  "TargetServiceID": "web",
-  "TargetServiceName": "web",
-  "ContentHash": "cffa5f4635b134b9",
-  "ExecMode": "daemon",
-  "Command": [
-    "/usr/local/bin/consul",
-    "connect",
-    "proxy"
-  ],
-  "Config": {
-    "bind_address": "127.0.0.1",
-    "bind_port": 20199,
-    "local_service_address": "127.0.0.1:8181"
-  },
-  "Upstreams": [
-    {
-        "DestinationType": "service",
-        "DestinationName": "db",
-        "LocalBindPort": 1234,
-        "Config": {
-            "connect_timeout_ms": 1000
-        }
-    },
-    {
-        "DestinationType": "prepared_query",
-        "DestinationName": "geo-cache",
-        "LocalBindPort": 1235
-    }
-  ]
-}
-```
-
-- `ProxyServiceID` `string` - The ID of the proxy service.
-
-- `TargetServiceID` `(string)` - The ID of the target service the proxy represents.
-
-- `TargetServiceName` `(string)` - The name of the target service the proxy represents.
-
-- `ContentHash` `(string)` - The content hash of the response used for hash-based
-  blocking queries.
-
-- `ExecMode` `(string)` - The execution mode of the managed proxy.
-
-- `Command` `(array<string>)` - The command for the managed proxy.
-
-- `Config` `(map<string|any>)` - The configuration for the managed proxy. This
-  is a map of primitive values (including arrays and maps) that is set by the
-  user.
-
-- `Upstreams` `(array<Upstream>)` - The configured upstreams for the proxy. See 
-[Upstream Configuration Reference](/docs/connect/proxies.html#upstream-configuration-reference)
-for more details on the format.

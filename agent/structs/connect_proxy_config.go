@@ -1,15 +1,78 @@
 package structs
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/lib"
 )
+
+type MeshGatewayMode string
+
+const (
+	// MeshGatewayModeDefault represents no specific mode and should
+	// be used to indicate that a different layer of the configuration
+	// chain should take precedence
+	MeshGatewayModeDefault MeshGatewayMode = ""
+
+	// MeshGatewayModeNone represents that the Upstream Connect connections
+	// should be direct and not flow through a mesh gateway.
+	MeshGatewayModeNone MeshGatewayMode = "none"
+
+	// MeshGatewayModeLocal represents that the Upstrea Connect connections
+	// should be made to a mesh gateway in the local datacenter. This is
+	MeshGatewayModeLocal MeshGatewayMode = "local"
+
+	// MeshGatewayModeRemote represents that the Upstream Connect connections
+	// should be made to a mesh gateway in a remote datacenter.
+	MeshGatewayModeRemote MeshGatewayMode = "remote"
+)
+
+// MeshGatewayConfig controls how Mesh Gateways are configured and used
+// This is a struct to allow for future additions without having more free-hanging
+// configuration items all over the place
+type MeshGatewayConfig struct {
+	// The Mesh Gateway routing mode
+	Mode MeshGatewayMode `json:",omitempty"`
+}
+
+func (c *MeshGatewayConfig) IsZero() bool {
+	zeroVal := MeshGatewayConfig{}
+	return *c == zeroVal
+}
+
+func (base *MeshGatewayConfig) OverlayWith(overlay MeshGatewayConfig) MeshGatewayConfig {
+	out := *base
+	if overlay.Mode != MeshGatewayModeDefault {
+		out.Mode = overlay.Mode
+	}
+	return out
+}
+
+func ValidateMeshGatewayMode(mode string) (MeshGatewayMode, error) {
+	switch MeshGatewayMode(mode) {
+	case MeshGatewayModeNone:
+		return MeshGatewayModeNone, nil
+	case MeshGatewayModeDefault:
+		return MeshGatewayModeDefault, nil
+	case MeshGatewayModeLocal:
+		return MeshGatewayModeLocal, nil
+	case MeshGatewayModeRemote:
+		return MeshGatewayModeRemote, nil
+	default:
+		return MeshGatewayModeDefault, fmt.Errorf("Invalid Mesh Gateway Mode: %q", mode)
+	}
+}
+
+func (c *MeshGatewayConfig) ToAPI() api.MeshGatewayConfig {
+	return api.MeshGatewayConfig{Mode: api.MeshGatewayMode(c.Mode)}
+}
 
 // ConnectProxyConfig describes the configuration needed for any proxy managed
 // or unmanaged. It describes a single logical service's listener and optionally
 // upstreams and sidecar-related config for a single instance. To describe a
-// centralised proxy that routed traffic for multiple services, a different one
+// centralized proxy that routed traffic for multiple services, a different one
 // of these would be needed for each, sharing the same LogicalProxyID.
 type ConnectProxyConfig struct {
 	// DestinationServiceName is required and is the name of the service to accept
@@ -38,11 +101,27 @@ type ConnectProxyConfig struct {
 
 	// Config is the arbitrary configuration data provided with the proxy
 	// registration.
-	Config map[string]interface{} `json:",omitempty"`
+	Config map[string]interface{} `json:",omitempty" bexpr:"-"`
 
 	// Upstreams describes any upstream dependencies the proxy instance should
 	// setup.
 	Upstreams Upstreams `json:",omitempty"`
+
+	// MeshGateway defines the mesh gateway configuration for this upstream
+	MeshGateway MeshGatewayConfig `json:",omitempty"`
+}
+
+func (c *ConnectProxyConfig) MarshalJSON() ([]byte, error) {
+	type typeCopy ConnectProxyConfig
+	copy := typeCopy(*c)
+
+	proxyConfig, err := lib.MapWalk(copy.Config)
+	if err != nil {
+		return nil, err
+	}
+	copy.Config = proxyConfig
+
+	return json.Marshal(&copy)
 }
 
 // ToAPI returns the api struct with the same fields. We have duplicates to
@@ -57,6 +136,7 @@ func (c *ConnectProxyConfig) ToAPI() *api.AgentServiceConnectProxyConfig {
 		LocalServicePort:       c.LocalServicePort,
 		Config:                 c.Config,
 		Upstreams:              c.Upstreams.ToAPI(),
+		MeshGateway:            c.MeshGateway.ToAPI(),
 	}
 }
 
@@ -119,16 +199,21 @@ type Upstream struct {
 	LocalBindPort int
 
 	// Config is an opaque config that is specific to the proxy process being run.
-	// It can be used to pass abritrary configuration for this specific upstream
+	// It can be used to pass arbitrary configuration for this specific upstream
 	// to the proxy.
-	Config map[string]interface{}
+	Config map[string]interface{} `bexpr:"-"`
+
+	// MeshGateway is the configuration for mesh gateway usage of this upstream
+	MeshGateway MeshGatewayConfig `json:",omitempty"`
 }
 
 // Validate sanity checks the struct is valid
 func (u *Upstream) Validate() error {
-	if u.DestinationType != UpstreamDestTypeService &&
-		u.DestinationType != UpstreamDestTypePreparedQuery {
-		return fmt.Errorf("unknown upstream destination type")
+	switch u.DestinationType {
+	case UpstreamDestTypePreparedQuery:
+	case UpstreamDestTypeService, "":
+	default:
+		return fmt.Errorf("unknown upstream destination type: %q", u.DestinationType)
 	}
 
 	if u.DestinationName == "" {
@@ -154,7 +239,40 @@ func (u *Upstream) ToAPI() api.Upstream {
 		LocalBindAddress:     u.LocalBindAddress,
 		LocalBindPort:        u.LocalBindPort,
 		Config:               u.Config,
+		MeshGateway:          u.MeshGateway.ToAPI(),
 	}
+}
+
+// ToKey returns a value-type representation that uniquely identifies the
+// upstream in a canonical way. Set and unset values are deliberately handled
+// differently.
+//
+// These fields should be user-specificed explicit values and not inferred
+// values.
+func (u *Upstream) ToKey() UpstreamKey {
+	return UpstreamKey{
+		DestinationType:      u.DestinationType,
+		DestinationNamespace: u.DestinationNamespace,
+		DestinationName:      u.DestinationName,
+		Datacenter:           u.Datacenter,
+	}
+}
+
+type UpstreamKey struct {
+	DestinationType      string
+	DestinationName      string
+	DestinationNamespace string
+	Datacenter           string
+}
+
+func (k UpstreamKey) String() string {
+	return fmt.Sprintf(
+		"[type=%q, name=%q, namespace=%q, datacenter=%q]",
+		k.DestinationType,
+		k.DestinationName,
+		k.DestinationNamespace,
+		k.Datacenter,
+	)
 }
 
 // Identifier returns a string representation that uniquely identifies the
@@ -168,8 +286,11 @@ func (u *Upstream) Identifier() string {
 		name += "?dc=" + u.Datacenter
 	}
 	typ := u.DestinationType
-	if typ == "" {
-		typ = UpstreamDestTypeService
+	// Service is default type so never prefix it. This is more readable and long
+	// term it is the only type that matters so we can drop the prefix and have
+	// nicer naming in metrics etc.
+	if typ == "" || typ == UpstreamDestTypeService {
+		return name
 	}
 	return typ + ":" + name
 }

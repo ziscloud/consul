@@ -1,24 +1,30 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 
 	"github.com/NYTimes/gziphandler"
 	metrics "github.com/armon/go-metrics"
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/cache"
+	"github.com/hashicorp/consul/agent/consul"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/api"
 	cleanhttp "github.com/hashicorp/go-cleanhttp"
 	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
@@ -41,6 +47,15 @@ type BadRequestError struct {
 
 func (e BadRequestError) Error() string {
 	return fmt.Sprintf("Bad request: %s", e.Reason)
+}
+
+// NotFoundError should be returned by a handler when a resource specified does not exist
+type NotFoundError struct {
+	Reason string
+}
+
+func (e NotFoundError) Error() string {
+	return e.Reason
 }
 
 // CodeWithPayloadError allow returning non HTTP 200
@@ -72,6 +87,66 @@ type HTTPServer struct {
 	// proto is filled by the agent to "http" or "https".
 	proto string
 }
+type templatedFile struct {
+	templated *bytes.Reader
+	name      string
+	mode      os.FileMode
+	modTime   time.Time
+}
+
+func newTemplatedFile(buf *bytes.Buffer, raw http.File) *templatedFile {
+	info, _ := raw.Stat()
+	return &templatedFile{
+		templated: bytes.NewReader(buf.Bytes()),
+		name:      info.Name(),
+		mode:      info.Mode(),
+		modTime:   info.ModTime(),
+	}
+}
+
+func (t *templatedFile) Read(p []byte) (n int, err error) {
+	return t.templated.Read(p)
+}
+
+func (t *templatedFile) Seek(offset int64, whence int) (int64, error) {
+	return t.templated.Seek(offset, whence)
+}
+
+func (t *templatedFile) Close() error {
+	return nil
+}
+
+func (t *templatedFile) Readdir(count int) ([]os.FileInfo, error) {
+	return nil, errors.New("not a directory")
+}
+
+func (t *templatedFile) Stat() (os.FileInfo, error) {
+	return t, nil
+}
+
+func (t *templatedFile) Name() string {
+	return t.name
+}
+
+func (t *templatedFile) Size() int64 {
+	return int64(t.templated.Len())
+}
+
+func (t *templatedFile) Mode() os.FileMode {
+	return t.mode
+}
+
+func (t *templatedFile) ModTime() time.Time {
+	return t.modTime
+}
+
+func (t *templatedFile) IsDir() bool {
+	return false
+}
+
+func (t *templatedFile) Sys() interface{} {
+	return nil
+}
 
 type redirectFS struct {
 	fs http.FileSystem
@@ -82,6 +157,25 @@ func (fs *redirectFS) Open(name string) (http.File, error) {
 	if err != nil {
 		file, err = fs.fs.Open("/index.html")
 	}
+	return file, err
+}
+
+type templatedIndexFS struct {
+	fs          http.FileSystem
+	ContentPath string
+}
+
+func (fs *templatedIndexFS) Open(name string) (http.File, error) {
+	file, err := fs.fs.Open(name)
+	if err == nil && name == "/index.html" {
+		content, _ := ioutil.ReadAll(file)
+		file.Seek(0, 0)
+		t, _ := template.New("fmtedindex").Parse(string(content))
+		var out bytes.Buffer
+		err = t.Execute(&out, fs)
+		file = newTemplatedFile(&out, file)
+	}
+
 	return file, err
 }
 
@@ -196,11 +290,10 @@ func (s *HTTPServer) handler(enableDebug bool) http.Handler {
 
 		handleFuncMetrics(pattern, http.HandlerFunc(wrapper))
 	}
-
 	mux.HandleFunc("/", s.Index)
 	for pattern, fn := range endpoints {
 		thisFn := fn
-		methods, _ := allowedMethods[pattern]
+		methods := allowedMethods[pattern]
 		bound := func(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
 			return thisFn(s, resp, req)
 		}
@@ -215,32 +308,17 @@ func (s *HTTPServer) handler(enableDebug bool) http.Handler {
 	handlePProf("/debug/pprof/trace", pprof.Trace)
 
 	if s.IsUIEnabled() {
-		legacy_ui, err := strconv.ParseBool(os.Getenv("CONSUL_UI_LEGACY"))
-		if err != nil {
-			legacy_ui = false
-		}
 		var uifs http.FileSystem
-
 		// Use the custom UI dir if provided.
 		if s.agent.config.UIDir != "" {
 			uifs = http.Dir(s.agent.config.UIDir)
 		} else {
 			fs := assetFS()
-
-			if legacy_ui {
-				fs.Prefix += "/v1/"
-			} else {
-				fs.Prefix += "/v2/"
-			}
 			uifs = fs
 		}
-
-		if !legacy_ui {
-			uifs = &redirectFS{fs: uifs}
-		}
-
+		uifs = &redirectFS{fs: &templatedIndexFS{fs: uifs, ContentPath: s.agent.config.UIContentPath}}
 		mux.Handle("/robots.txt", http.FileServer(uifs))
-		mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(uifs)))
+		mux.Handle(s.agent.config.UIContentPath, http.StripPrefix(s.agent.config.UIContentPath, http.FileServer(uifs)))
 	}
 
 	// Wrap the whole mux with a handler that bans URLs with non-printable
@@ -335,6 +413,16 @@ func (s *HTTPServer) wrap(handler endpoint, methods []string) http.HandlerFunc {
 			return ok
 		}
 
+		isNotFound := func(err error) bool {
+			_, ok := err.(NotFoundError)
+			return ok
+		}
+
+		isTooManyRequests := func(err error) bool {
+			// Sadness net/rpc can't do nice typed errors so this is all we got
+			return err.Error() == consul.ErrRateLimited.Error()
+		}
+
 		addAllowHeader := func(methods []string) {
 			resp.Header().Add("Allow", strings.Join(methods, ","))
 		}
@@ -357,6 +445,12 @@ func (s *HTTPServer) wrap(handler endpoint, methods []string) http.HandlerFunc {
 				fmt.Fprint(resp, err.Error())
 			case isBadRequest(err):
 				resp.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(resp, err.Error())
+			case isNotFound(err):
+				resp.WriteHeader(http.StatusNotFound)
+				fmt.Fprintf(resp, err.Error())
+			case isTooManyRequests(err):
+				resp.WriteHeader(http.StatusTooManyRequests)
 				fmt.Fprint(resp, err.Error())
 			default:
 				resp.WriteHeader(http.StatusInternalServerError)
@@ -475,7 +569,7 @@ func (s *HTTPServer) Index(resp http.ResponseWriter, req *http.Request) {
 	}
 
 	// Redirect to the UI endpoint
-	http.Redirect(resp, req, "/ui/", http.StatusMovedPermanently) // 301
+	http.Redirect(resp, req, s.agent.config.UIContentPath, http.StatusMovedPermanently) // 301
 }
 
 // decodeBody is used to decode a JSON request body
@@ -499,7 +593,47 @@ func decodeBody(req *http.Request, out interface{}, cb func(interface{}) error) 
 			return err
 		}
 	}
-	return mapstructure.Decode(raw, out)
+
+	decodeConf := &mapstructure.DecoderConfig{
+		DecodeHook: mapstructure.ComposeDecodeHookFunc(
+			mapstructure.StringToTimeDurationHookFunc(),
+			stringToReadableDurationFunc(),
+		),
+		Result: &out,
+	}
+
+	decoder, err := mapstructure.NewDecoder(decodeConf)
+	if err != nil {
+		return err
+	}
+
+	return decoder.Decode(raw)
+}
+
+// stringToReadableDurationFunc is a mapstructure hook for decoding a string
+// into an api.ReadableDuration for backwards compatibility.
+func stringToReadableDurationFunc() mapstructure.DecodeHookFunc {
+	return func(
+		f reflect.Type,
+		t reflect.Type,
+		data interface{}) (interface{}, error) {
+		var v api.ReadableDuration
+		if t != reflect.TypeOf(v) {
+			return data, nil
+		}
+
+		switch {
+		case f.Kind() == reflect.String:
+			if dur, err := time.ParseDuration(data.(string)); err != nil {
+				return nil, err
+			} else {
+				v = api.ReadableDuration(dur)
+			}
+			return v, nil
+		default:
+			return data, nil
+		}
+	}
 }
 
 // setTranslateAddr is used to set the address translation header. This is only
@@ -730,7 +864,7 @@ func (s *HTTPServer) parseDC(req *http.Request, dc *string) {
 // optionally resolve proxy tokens to real ACL tokens. If the token is invalid or not specified it will populate
 // the token with the agents UserToken (acl_token in the consul configuration)
 // Parsing has the following priority: ?token, X-Consul-Token and last "Authorization: Bearer "
-func (s *HTTPServer) parseTokenInternal(req *http.Request, token *string, resolveProxyToken bool) {
+func (s *HTTPServer) parseTokenInternal(req *http.Request, token *string) {
 	tok := ""
 	if other := req.URL.Query().Get("token"); other != "" {
 		tok = other
@@ -758,13 +892,6 @@ func (s *HTTPServer) parseTokenInternal(req *http.Request, token *string, resolv
 	}
 
 	if tok != "" {
-		if resolveProxyToken {
-			if p := s.agent.resolveProxyToken(tok); p != nil {
-				*token = s.agent.State.ServiceToken(p.Proxy.TargetServiceID)
-				return
-			}
-		}
-
 		*token = tok
 		return
 	}
@@ -773,15 +900,9 @@ func (s *HTTPServer) parseTokenInternal(req *http.Request, token *string, resolv
 }
 
 // parseToken is used to parse the ?token query param or the X-Consul-Token header or
-// Authorization Bearer token header (RFC6750) and resolve proxy tokens to real ACL tokens
+// Authorization Bearer token header (RFC6750)
 func (s *HTTPServer) parseToken(req *http.Request, token *string) {
-	s.parseTokenInternal(req, token, true)
-}
-
-// parseTokenWithoutResolvingProxyToken is used to parse the ?token query param or the X-Consul-Token header
-// or Authorization Bearer header token (RFC6750) and
-func (s *HTTPServer) parseTokenWithoutResolvingProxyToken(req *http.Request, token *string) {
-	s.parseTokenInternal(req, token, false)
+	s.parseTokenInternal(req, token)
 }
 
 func sourceAddrFromRequest(req *http.Request) string {
@@ -838,9 +959,10 @@ func (s *HTTPServer) parseMetaFilter(req *http.Request) map[string]string {
 
 // parseInternal is a convenience method for endpoints that need
 // to use both parseWait and parseDC.
-func (s *HTTPServer) parseInternal(resp http.ResponseWriter, req *http.Request, dc *string, b *structs.QueryOptions, resolveProxyToken bool) bool {
+func (s *HTTPServer) parseInternal(resp http.ResponseWriter, req *http.Request, dc *string, b *structs.QueryOptions) bool {
 	s.parseDC(req, dc)
-	s.parseTokenInternal(req, &b.Token, resolveProxyToken)
+	s.parseTokenInternal(req, &b.Token)
+	s.parseFilter(req, &b.Filter)
 	if s.parseConsistency(resp, req, b) {
 		return true
 	}
@@ -853,12 +975,7 @@ func (s *HTTPServer) parseInternal(resp http.ResponseWriter, req *http.Request, 
 // parse is a convenience method for endpoints that need
 // to use both parseWait and parseDC.
 func (s *HTTPServer) parse(resp http.ResponseWriter, req *http.Request, dc *string, b *structs.QueryOptions) bool {
-	return s.parseInternal(resp, req, dc, b, true)
-}
-
-// parseWithoutResolvingProxyToken is a convenience method similar to parse except that it disables resolving proxy tokens
-func (s *HTTPServer) parseWithoutResolvingProxyToken(resp http.ResponseWriter, req *http.Request, dc *string, b *structs.QueryOptions) bool {
-	return s.parseInternal(resp, req, dc, b, false)
+	return s.parseInternal(resp, req, dc, b)
 }
 
 func (s *HTTPServer) checkWriteAccess(req *http.Request) error {
@@ -885,4 +1002,10 @@ func (s *HTTPServer) checkWriteAccess(req *http.Request) error {
 	}
 
 	return ForbiddenError{}
+}
+
+func (s *HTTPServer) parseFilter(req *http.Request, filter *string) {
+	if other := req.URL.Query().Get("filter"); other != "" {
+		*filter = other
+	}
 }

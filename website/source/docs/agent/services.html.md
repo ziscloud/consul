@@ -37,6 +37,16 @@ example shows all possible fields, but note that only a few are required.
     "meta": {
       "meta": "for my service"
     },
+    "tagged_addresses": {
+      "lan": {
+        "address": "192.168.0.55",
+        "port": 8000,
+      },
+      "wan": {
+        "address": "198.18.0.23",
+        "port": 80
+      }
+    },
     "port": 8000,
     "enable_tag_override": false,
     "checks": [
@@ -50,10 +60,13 @@ example shows all possible fields, but note that only a few are required.
     "proxy": {
       "destination_service_name": "redis",
       "destination_service_id": "redis1",
-      "local_service_name": "127.0.0.1",
+      "local_service_address": "127.0.0.1",
       "local_service_port": 9090,
       "config": {},
-      "upstreams": []
+      "upstreams": [],
+      "mesh_gateway": {
+        "mode": "local"
+      }
     },
     "connect": {
       "native": false,
@@ -66,7 +79,8 @@ example shows all possible fields, but note that only a few are required.
     "weights": {
       "passing": 5,
       "warning": 1
-    }
+    },
+    "token": "233b604b-b92e-48c8-a253-5f11514e4b50"
   }
 }
 ```
@@ -129,12 +143,13 @@ deprecated and has been removed as of Consul 1.1.
 ### Connect
 
 The `kind` field is used to optionally identify the service as a [Connect
-proxy](/docs/connect/proxies.html) instance with the value `connect-proxy`. For
+proxy](/docs/connect/proxies.html) instance with the value `connect-proxy` or
+a [Mesh Gateway](/docs/connect/mesh_gateway.html) instance with the value `mesh-gateway`. For
 typical non-proxy instances the `kind` field must be omitted. The `proxy` field
 is also required for Connect proxy registrations and is only valid if `kind` is
 `connect-proxy`. The only required `proxy` field is `destination_service_name`.
 For more detail please see [complete proxy configuration
-example](/docs/connect/proxies.html#complete-configuration-example)
+example](/docs/connect/registration/service-registration.html#complete-configuration-example)
 
 -> **Deprecation Notice:** From version 1.2.0 to 1.3.0, proxy destination was
 specified using `proxy_destination` at the top level. This will continue to work
@@ -147,7 +162,7 @@ Consul 1.2.0 and later. The `native` value can be set to true to advertise the
 service as [Connect-native](/docs/connect/native.html). The `sidecar_service`
 field is an optional nested service definition its behavior and defaults are
 described in [Sidecar Service
-Registration](/docs/connect/proxies/sidecar-service.html). If `native` is true,
+Registration](/docs/connect/registration/sidecar-service.html). If `native` is true,
 it is an error to also specify a sidecar service registration.
 
 -> **Deprecation Notice:** From version 1.2.0 to 1.3.0 during beta, Connect
@@ -234,7 +249,7 @@ Multiple services definitions can be provided at once using the plural
         {
           "args": ["/bin/check_redis", "-p", "6000"],
           "interval": "5s",
-          "ttl": "20s"
+          "timeout": "20s"
         }
       ]
     },
@@ -251,11 +266,49 @@ Multiple services definitions can be provided at once using the plural
         {
           "args": ["/bin/check_redis", "-p", "7000"],
           "interval": "30s",
-          "ttl": "60s"
+          "timeout": "60s"
         }
       ]
     },
     ...
+  ]
+}
+```
+
+In HCL you can specify the plural `services` key (although not `service`) multiple times:
+
+```hcl
+services {
+  id = "red0"
+  name = "redis"
+  tags = [
+    "primary"
+  ]
+  address = ""
+  port = 6000
+  checks = [
+    {
+      args = ["/bin/check_redis", "-p", "6000"]
+      interval = "5s"
+      timeout = "20s"
+    }
+  ]
+}
+services {
+  id = "red1"
+  name = "redis"
+  tags = [
+    "delayed",
+    "secondary"
+  ]
+  address = ""
+  port = 7000
+  checks = [
+    {
+      args = ["/bin/check_redis", "-p", "7000"]
+      interval = "30s"
+      timeout = "60s"
+    }
   ]
 }
 ```
@@ -279,7 +332,7 @@ For historical reasons Consul's API uses `CamelCased` parameter names in
 responses, however it's configuration file uses `snake_case` for both HCL and
 JSON representations. For this reason the registration _HTTP APIs_ accept both
 name styles for service definition parameters although APIs will return the
-listings using `CamelCase`. 
+listings using `CamelCase`.
 
 Note though that **all config file formats require
 `snake_case` fields**. We always document service definition examples using

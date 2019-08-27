@@ -2,6 +2,7 @@ package consul
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,8 +16,10 @@ import (
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/lib"
 	memdb "github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-raftchunking"
 	"github.com/hashicorp/memberlist"
-	"github.com/hashicorp/net-rpc-msgpackrpc"
+	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc"
+	"github.com/hashicorp/raft"
 	"github.com/hashicorp/yamux"
 )
 
@@ -43,6 +46,10 @@ const (
 	// value is ever reached. However, it prevents us from blocking
 	// the requesting goroutine forever.
 	enqueueLimit = 30 * time.Second
+)
+
+var (
+	ErrChunkingResubmit = errors.New("please resubmit call for rechunking")
 )
 
 // listen is used to listen for incoming RPC connections
@@ -84,7 +91,7 @@ func (s *Server) handleConn(conn net.Conn, isTLS bool) {
 	typ := pool.RPCType(buf[0])
 
 	// Enforce TLS if VerifyIncoming is set
-	if s.config.VerifyIncoming && !isTLS && typ != pool.RPCTLS {
+	if s.tlsConfigurator.VerifyIncomingRPC() && !isTLS && typ != pool.RPCTLS && typ != pool.RPCTLSInsecure {
 		s.logger.Printf("[WARN] consul.rpc: Non-TLS connection attempted with VerifyIncoming set %s", logConn(conn))
 		conn.Close()
 		return
@@ -100,12 +107,7 @@ func (s *Server) handleConn(conn net.Conn, isTLS bool) {
 		s.raftLayer.Handoff(conn)
 
 	case pool.RPCTLS:
-		if s.rpcTLS == nil {
-			s.logger.Printf("[WARN] consul.rpc: TLS connection attempted, server not configured for TLS %s", logConn(conn))
-			conn.Close()
-			return
-		}
-		conn = tls.Server(conn, s.rpcTLS)
+		conn = tls.Server(conn, s.tlsConfigurator.IncomingRPCConfig())
 		s.handleConn(conn, true)
 
 	case pool.RPCMultiplexV2:
@@ -113,6 +115,10 @@ func (s *Server) handleConn(conn net.Conn, isTLS bool) {
 
 	case pool.RPCSnapshot:
 		s.handleSnapshotConn(conn)
+
+	case pool.RPCTLSInsecure:
+		conn = tls.Server(conn, s.tlsConfigurator.IncomingInsecureRPCConfig())
+		s.handleInsecureConn(conn)
 
 	default:
 		if !s.handleEnterpriseRPCConn(typ, conn, isTLS) {
@@ -163,6 +169,28 @@ func (s *Server) handleConsulConn(conn net.Conn) {
 	}
 }
 
+// handleInsecureConsulConn is used to service a single Consul INSECURERPC connection
+func (s *Server) handleInsecureConn(conn net.Conn) {
+	defer conn.Close()
+	rpcCodec := msgpackrpc.NewServerCodec(conn)
+	for {
+		select {
+		case <-s.shutdownCh:
+			return
+		default:
+		}
+
+		if err := s.insecureRPCServer.ServeRequest(rpcCodec); err != nil {
+			if err != io.EOF && !strings.Contains(err.Error(), "closed") {
+				s.logger.Printf("[ERR] consul.rpc: INSECURERPC error: %v %s", err, logConn(conn))
+				metrics.IncrCounter([]string{"rpc", "request_error"}, 1)
+			}
+			return
+		}
+		metrics.IncrCounter([]string{"rpc", "request"}, 1)
+	}
+}
+
 // handleSnapshotConn is used to dispatch snapshot saves and restores, which
 // stream so don't use the normal RPC mechanism.
 func (s *Server) handleSnapshotConn(conn net.Conn) {
@@ -179,6 +207,12 @@ func canRetry(args interface{}, err error) bool {
 	// No leader errors are always safe to retry since no state could have
 	// been changed.
 	if structs.IsErrNoLeader(err) {
+		return true
+	}
+
+	// If we are chunking and it doesn't seem to have completed, try again
+	intErr, ok := args.(error)
+	if ok && strings.Contains(intErr.Error(), ErrChunkingResubmit.Error()) {
 		return true
 	}
 
@@ -345,12 +379,43 @@ func (s *Server) raftApply(t structs.MessageType, msg interface{}) (interface{},
 		s.logger.Printf("[WARN] consul: Attempting to apply large raft entry (%d bytes)", n)
 	}
 
-	future := s.raft.Apply(buf, enqueueLimit)
+	var chunked bool
+	var future raft.ApplyFuture
+	switch {
+	case len(buf) <= raft.SuggestedMaxDataSize || t != structs.KVSRequestType:
+		future = s.raft.Apply(buf, enqueueLimit)
+	default:
+		chunked = true
+		future = raftchunking.ChunkingApply(buf, nil, enqueueLimit, s.raft.ApplyLog)
+	}
+
 	if err := future.Error(); err != nil {
 		return nil, err
 	}
 
-	return future.Response(), nil
+	resp := future.Response()
+
+	if chunked {
+		// In this case we didn't apply all chunks successfully, possibly due
+		// to a term change; resubmit
+		if resp == nil {
+			// This returns the error in the interface because the raft library
+			// returns errors from the FSM via the future, not via err from the
+			// apply function. Downstream client code expects to see any error
+			// from the FSM (as opposed to the apply itself) and decide whether
+			// it can retry in the future's response.
+			return ErrChunkingResubmit, nil
+		}
+		// We expect that this conversion should always work
+		chunkedSuccess, ok := resp.(raftchunking.ChunkingSuccess)
+		if !ok {
+			return nil, errors.New("unknown type of response back from chunking FSM")
+		}
+		// Return the inner wrapped response
+		return chunkedSuccess.Response, nil
+	}
+
+	return resp, nil
 }
 
 // queryFn is used to perform a query operation. If a re-query is needed, the
@@ -417,7 +482,7 @@ RUN_QUERY:
 	err := fn(ws, state)
 	// Note we check queryOpts.MinQueryIndex is greater than zero to determine if
 	// blocking was requested by client, NOT meta.Index since the state function
-	// might return zero if something is not initialised and care wasn't taken to
+	// might return zero if something is not initialized and care wasn't taken to
 	// handle that special case (in practice this happened a lot so fixing it
 	// systematically here beats trying to remember to add zero checks in every
 	// state method). We also need to ensure that unless there is an error, we

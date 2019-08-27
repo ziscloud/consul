@@ -138,7 +138,7 @@ func (c *ConsulProvider) GenerateRoot() error {
 	// Generate a private key if needed
 	newState := *providerState
 	if c.config.PrivateKey == "" {
-		_, pk, err := connect.GeneratePrivateKey()
+		_, pk, err := connect.GeneratePrivateKeyWithConfig(c.config.PrivateKeyType, c.config.PrivateKeyBits)
 		if err != nil {
 			return err
 		}
@@ -184,7 +184,7 @@ func (c *ConsulProvider) GenerateIntermediateCSR() (string, error) {
 	}
 
 	// Create a new private key and CSR.
-	signer, pk, err := connect.GeneratePrivateKey()
+	signer, pk, err := connect.GeneratePrivateKeyWithConfig(c.config.PrivateKeyType, c.config.PrivateKeyBits)
 	if err != nil {
 		return "", err
 	}
@@ -323,10 +323,12 @@ func (c *ConsulProvider) Sign(csr *x509.CertificateRequest) (string, error) {
 	defer c.Unlock()
 
 	// Get the provider state
-	state := c.Delegate.State()
-	idx, providerState, err := state.CAProviderState(c.id)
+	idx, providerState, err := c.getState()
 	if err != nil {
 		return "", err
+	}
+	if providerState.PrivateKey == "" {
+		return "", ErrNotInitialized
 	}
 
 	// Create the keyId for the cert from the signing private key.
@@ -347,8 +349,14 @@ func (c *ConsulProvider) Sign(csr *x509.CertificateRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	serviceId, ok := spiffeId.(*connect.SpiffeIDService)
-	if !ok {
+
+	subject := ""
+	switch id := spiffeId.(type) {
+	case *connect.SpiffeIDService:
+		subject = id.Service
+	case *connect.SpiffeIDAgent:
+		subject = id.Agent
+	default:
 		return "", fmt.Errorf("SPIFFE ID in CSR must be a service ID")
 	}
 
@@ -366,12 +374,12 @@ func (c *ConsulProvider) Sign(csr *x509.CertificateRequest) (string, error) {
 	sn := &big.Int{}
 	sn.SetUint64(idx + 1)
 	// Sign the certificate valid from 1 minute in the past, this helps it be
-	// accepted right away even when nodes are not in close time sync accross the
+	// accepted right away even when nodes are not in close time sync across the
 	// cluster. A minute is more than enough for typical DC clock drift.
 	effectiveNow := time.Now().Add(-1 * time.Minute)
 	template := x509.Certificate{
 		SerialNumber:          sn,
-		Subject:               pkix.Name{CommonName: serviceId.Service},
+		Subject:               pkix.Name{CommonName: subject},
 		URIs:                  csr.URIs,
 		Signature:             csr.Signature,
 		SignatureAlgorithm:    csr.SignatureAlgorithm,
@@ -457,7 +465,7 @@ func (c *ConsulProvider) SignIntermediate(csr *x509.CertificateRequest) (string,
 	sn := &big.Int{}
 	sn.SetUint64(idx + 1)
 	// Sign the certificate valid from 1 minute in the past, this helps it be
-	// accepted right away even when nodes are not in close time sync accross the
+	// accepted right away even when nodes are not in close time sync across the
 	// cluster. A minute is more than enough for typical DC clock drift.
 	effectiveNow := time.Now().Add(-1 * time.Minute)
 	template := x509.Certificate{
@@ -474,7 +482,7 @@ func (c *ConsulProvider) SignIntermediate(csr *x509.CertificateRequest) (string,
 			x509.KeyUsageDigitalSignature,
 		IsCA:           true,
 		MaxPathLenZero: true,
-		NotAfter:       effectiveNow.Add(365 * 24 * time.Hour),
+		NotAfter:       effectiveNow.AddDate(1, 0, 0),
 		NotBefore:      effectiveNow,
 		SubjectKeyId:   subjectKeyId,
 	}
@@ -506,8 +514,7 @@ func (c *ConsulProvider) CrossSignCA(cert *x509.Certificate) (string, error) {
 	defer c.Unlock()
 
 	// Get the provider state
-	state := c.Delegate.State()
-	idx, providerState, err := state.CAProviderState(c.id)
+	idx, providerState, err := c.getState()
 	if err != nil {
 		return "", err
 	}
@@ -536,7 +543,7 @@ func (c *ConsulProvider) CrossSignCA(cert *x509.Certificate) (string, error) {
 	template.AuthorityKeyId = keyId
 
 	// Sign the certificate valid from 1 minute in the past, this helps it be
-	// accepted right away even when nodes are not in close time sync accross the
+	// accepted right away even when nodes are not in close time sync across the
 	// cluster. A minute is more than enough for typical DC clock drift.
 	effectiveNow := time.Now().Add(-1 * time.Minute)
 	template.NotBefore = effectiveNow
@@ -544,7 +551,7 @@ func (c *ConsulProvider) CrossSignCA(cert *x509.Certificate) (string, error) {
 	// leaf certs are still in use. They expire within 3 days currently so 7 is
 	// safe. TODO(banks): make this be based on leaf expiry time when that is
 	// configurable.
-	template.NotAfter = effectiveNow.Add(7 * 24 * time.Hour)
+	template.NotAfter = effectiveNow.AddDate(0, 0, 7)
 
 	bs, err := x509.CreateCertificate(
 		rand.Reader, &template, rootCA, cert.PublicKey, privKey)
@@ -600,7 +607,7 @@ func (c *ConsulProvider) incrementProviderIndex(providerState *structs.CAConsulP
 // generateCA makes a new root CA using the current private key
 func (c *ConsulProvider) generateCA(privateKey string, sn uint64) (string, error) {
 	state := c.Delegate.State()
-	_, config, err := state.CAConfig()
+	_, config, err := state.CAConfig(nil)
 	if err != nil {
 		return "", err
 	}
@@ -631,7 +638,7 @@ func (c *ConsulProvider) generateCA(privateKey string, sn uint64) (string, error
 			x509.KeyUsageCRLSign |
 			x509.KeyUsageDigitalSignature,
 		IsCA:           true,
-		NotAfter:       time.Now().Add(10 * 365 * 24 * time.Hour),
+		NotAfter:       time.Now().AddDate(10, 0, 0),
 		NotBefore:      time.Now(),
 		AuthorityKeyId: keyId,
 		SubjectKeyId:   keyId,

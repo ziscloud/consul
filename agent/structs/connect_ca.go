@@ -102,6 +102,10 @@ type CARoot struct {
 	// active root.
 	RotatedOutAt time.Time `json:"-"`
 
+	// Type of private key used to create the CA cert.
+	PrivateKeyType string
+	PrivateKeyBits int
+
 	RaftIndex
 }
 
@@ -140,8 +144,13 @@ type IssuedCert struct {
 
 	// Service is the name of the service for which the cert was issued.
 	// ServiceURI is the cert URI value.
-	Service    string
-	ServiceURI string
+	Service    string `json:",omitempty"`
+	ServiceURI string `json:",omitempty"`
+
+	// Agent is the name of the node for which the cert was issued.
+	// AgentURI is the cert URI value.
+	Agent    string `json:",omitempty"`
+	AgentURI string `json:",omitempty"`
 
 	// ValidAfter and ValidBefore are the validity periods for the
 	// certificate.
@@ -222,6 +231,10 @@ func (c *CAConfiguration) GetCommonConfig() (*CommonCAProviderConfig, error) {
 	}
 
 	var config CommonCAProviderConfig
+
+	// Set Defaults
+	config.CSRMaxPerSecond = 50 // See doc comment for rationale here.
+
 	decodeConf := &mapstructure.DecoderConfig{
 		DecodeHook:       ParseDurationFunc(),
 		Result:           &config,
@@ -244,6 +257,33 @@ type CommonCAProviderConfig struct {
 	LeafCertTTL time.Duration
 
 	SkipValidate bool
+
+	// CSRMaxPerSecond is a rate limit on processing Connect Certificate Signing
+	// Requests on the servers. It applies to all CA providers so can be used to
+	// limit rate to an external CA too. 0 disables the rate limit. Defaults to 50
+	// which is low enough to prevent overload of a reasonably sized production
+	// server while allowing a cluster with 1000 service instances to complete a
+	// rotation in 20 seconds. For reference a quad-core 2017 MacBook pro can
+	// process 100 signing RPCs a second while using less than half of one core.
+	// For large clusters with powerful servers it's advisable to increase this
+	// rate or to disable this limit and instead rely on CSRMaxConcurrent to only
+	// consume a subset of the server's cores.
+	CSRMaxPerSecond float32
+
+	// CSRMaxConcurrent is a limit on how many concurrent CSR signing requests
+	// will be processed in parallel. New incoming signing requests will try for
+	// `consul.csrSemaphoreWait` (currently 500ms) for a slot before being
+	// rejected with a "rate limited" backpressure response. This effectively sets
+	// how many CPU cores can be occupied by Connect CA signing activity and
+	// should be a (small) subset of your server's available cores to allow other
+	// tasks to complete when a barrage of CSRs come in (e.g. after a CA root
+	// rotation). Setting to 0 disables the limit, attempting to sign certs
+	// immediately in the RPC goroutine. This is 0 by default and CSRMaxPerSecond
+	// is used. This is ignored if CSRMaxPerSecond is non-zero.
+	CSRMaxConcurrent int
+
+	PrivateKeyType string
+	PrivateKeyBits int
 }
 
 func (c CommonCAProviderConfig) Validate() error {
@@ -257,6 +297,19 @@ func (c CommonCAProviderConfig) Validate() error {
 
 	if c.LeafCertTTL > 365*24*time.Hour {
 		return fmt.Errorf("leaf cert TTL must be less than 1 year")
+	}
+
+	switch c.PrivateKeyType {
+	case "ec":
+		if c.PrivateKeyBits != 224 && c.PrivateKeyBits != 256 && c.PrivateKeyBits != 384 && c.PrivateKeyBits != 521 {
+			return fmt.Errorf("ECDSA key length must be one of (224, 256, 384, 521) bits")
+		}
+	case "rsa":
+		if c.PrivateKeyBits != 2048 && c.PrivateKeyBits != 4096 {
+			return fmt.Errorf("RSA key length must be 2048 or 4096 bits")
+		}
+	default:
+		return fmt.Errorf("private key type must be either 'ecdsa' or 'rsa'")
 	}
 
 	return nil
@@ -294,6 +347,33 @@ type VaultCAProviderConfig struct {
 	KeyFile       string
 	TLSServerName string
 	TLSSkipVerify bool
+}
+
+// CALeafOp is the operation for a request related to leaf certificates.
+type CALeafOp string
+
+const (
+	CALeafOpIncrementIndex CALeafOp = "increment-index"
+)
+
+// CALeafRequest is used to modify connect CA leaf data. This is used by the
+// FSM (agent/consul/fsm) to apply changes.
+type CALeafRequest struct {
+	// Op is the type of operation being requested. This determines what
+	// other fields are required.
+	Op CALeafOp
+
+	// Datacenter is the target for this request.
+	Datacenter string
+
+	// WriteRequest is a common struct containing ACL tokens and other
+	// write-related common elements for requests.
+	WriteRequest
+}
+
+// RequestDatacenter returns the datacenter for a given request.
+func (q *CALeafRequest) RequestDatacenter() string {
+	return q.Datacenter
 }
 
 // ParseDurationFunc is a mapstructure hook for decoding a string or

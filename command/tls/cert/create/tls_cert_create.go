@@ -11,6 +11,7 @@ import (
 
 	"github.com/hashicorp/consul/command/flags"
 	"github.com/hashicorp/consul/command/tls"
+	"github.com/hashicorp/consul/tlsutil"
 	"github.com/mitchellh/cli"
 )
 
@@ -21,24 +22,25 @@ func New(ui cli.Ui) *cmd {
 }
 
 type cmd struct {
-	UI       cli.Ui
-	flags    *flag.FlagSet
-	ca       string
-	key      string
-	server   bool
-	client   bool
-	cli      bool
-	dc       string
-	days     int
-	domain   string
-	help     string
-	dnsnames flags.AppendSliceValue
-	prefix   string
+	UI          cli.Ui
+	flags       *flag.FlagSet
+	ca          string
+	key         string
+	server      bool
+	client      bool
+	cli         bool
+	dc          string
+	days        int
+	domain      string
+	help        string
+	dnsnames    flags.AppendSliceValue
+	ipaddresses flags.AppendSliceValue
+	prefix      string
 }
 
 func (c *cmd) init() {
 	c.flags = flag.NewFlagSet("", flag.ContinueOnError)
-	c.flags.StringVar(&c.ca, "ca", "#DOMAINa#-agent-ca.pem", "Provide path to the ca. Defaults to #DOMAIN#-agent-ca.pem.")
+	c.flags.StringVar(&c.ca, "ca", "#DOMAIN#-agent-ca.pem", "Provide path to the ca. Defaults to #DOMAIN#-agent-ca.pem.")
 	c.flags.StringVar(&c.key, "key", "#DOMAIN#-agent-ca-key.pem", "Provide path to the key. Defaults to #DOMAIN#-agent-ca-key.pem.")
 	c.flags.BoolVar(&c.server, "server", false, "Generate server certificate.")
 	c.flags.BoolVar(&c.client, "client", false, "Generate client certificate.")
@@ -47,7 +49,9 @@ func (c *cmd) init() {
 	c.flags.StringVar(&c.dc, "dc", "dc1", "Provide the datacenter. Matters only for -server certificates. Defaults to dc1.")
 	c.flags.StringVar(&c.domain, "domain", "consul", "Provide the domain. Matters only for -server certificates.")
 	c.flags.Var(&c.dnsnames, "additional-dnsname", "Provide an additional dnsname for Subject Alternative Names. "+
-		"127.0.0.1 and localhost are always included. This flag may be provided multiple times.")
+		"localhost is always included. This flag may be provided multiple times.")
+	c.flags.Var(&c.ipaddresses, "additional-ipaddress", "Provide an additional ipaddress for Subject Alternative Names. "+
+		"127.0.0.1 is always included. This flag may be provided multiple times.")
 	c.help = flags.Usage(help, c.flags)
 }
 
@@ -86,16 +90,22 @@ func (c *cmd) Run(args []string) int {
 		}
 	}
 
+	for _, i := range c.ipaddresses {
+		if len(i) > 0 {
+			IPAddresses = append(IPAddresses, net.ParseIP(strings.TrimSpace(i)))
+		}
+	}
+
 	if c.server {
 		name = fmt.Sprintf("server.%s.%s", c.dc, c.domain)
 		DNSNames = append(DNSNames, []string{name, "localhost"}...)
-		IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
+		IPAddresses = append(IPAddresses, net.ParseIP("127.0.0.1"))
 		extKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}
 		prefix = fmt.Sprintf("%s-server-%s", c.dc, c.domain)
 	} else if c.client {
 		name = fmt.Sprintf("client.%s.%s", c.dc, c.domain)
 		DNSNames = append(DNSNames, []string{name, "localhost"}...)
-		IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
+		IPAddresses = append(IPAddresses, net.ParseIP("127.0.0.1"))
 		extKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}
 		prefix = fmt.Sprintf("%s-client-%s", c.dc, c.domain)
 	} else if c.cli {
@@ -145,25 +155,25 @@ func (c *cmd) Run(args []string) int {
 	}
 	c.UI.Info("==> Using " + caFile + " and " + keyFile)
 
-	signer, err := tls.ParseSigner(string(key))
+	signer, err := tlsutil.ParseSigner(string(key))
 	if err != nil {
 		c.UI.Error(err.Error())
 		return 1
 	}
 
-	sn, err := tls.GenerateSerialNumber()
+	sn, err := tlsutil.GenerateSerialNumber()
 	if err != nil {
 		c.UI.Error(err.Error())
 		return 1
 	}
 
-	pub, priv, err := tls.GenerateCert(signer, string(cert), sn, name, c.days, DNSNames, IPAddresses, extKeyUsage)
+	pub, priv, err := tlsutil.GenerateCert(signer, string(cert), sn, name, c.days, DNSNames, IPAddresses, extKeyUsage)
 	if err != nil {
 		c.UI.Error(err.Error())
 		return 1
 	}
 
-	if err = tls.Verify(string(cert), pub, name); err != nil {
+	if err = tlsutil.Verify(string(cert), pub, name); err != nil {
 		c.UI.Error("==> " + err.Error())
 		return 1
 	}

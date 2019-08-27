@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"reflect"
 	"strings"
@@ -17,20 +18,20 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/acl"
-	"github.com/hashicorp/consul/agent/checks"
 	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/agent/connect"
 	"github.com/hashicorp/consul/agent/debug"
 	"github.com/hashicorp/consul/agent/local"
 	"github.com/hashicorp/consul/agent/structs"
+	tokenStore "github.com/hashicorp/consul/agent/token"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/logger"
+	"github.com/hashicorp/consul/sdk/testutil/retry"
 	"github.com/hashicorp/consul/testrpc"
-	"github.com/hashicorp/consul/testutil/retry"
 	"github.com/hashicorp/consul/types"
+	"github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/serf/serf"
-	"github.com/mitchellh/copystructure"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -53,7 +54,7 @@ func makeReadOnlyAgentACL(t *testing.T, srv *HTTPServer) string {
 
 func TestAgent_Services(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
@@ -68,20 +69,6 @@ func TestAgent_Services(t *testing.T) {
 	}
 	require.NoError(t, a.State.AddService(srv1, ""))
 
-	// Add a managed proxy for that service
-	prxy1 := &structs.ConnectManagedProxy{
-		ExecMode: structs.ProxyExecModeScript,
-		Command:  []string{"proxy.sh"},
-		Config: map[string]interface{}{
-			"bind_port": 1234,
-			"foo":       "bar",
-		},
-		TargetServiceID: "mysql",
-		Upstreams:       structs.TestUpstreams(t),
-	}
-	_, err := a.State.AddProxy(prxy1, "", "")
-	require.NoError(t, err)
-
 	req, _ := http.NewRequest("GET", "/v1/agent/services", nil)
 	obj, err := a.srv.AgentServices(nil, req)
 	if err != nil {
@@ -91,12 +78,48 @@ func TestAgent_Services(t *testing.T) {
 	assert.Lenf(t, val, 1, "bad services: %v", obj)
 	assert.Equal(t, 5000, val["mysql"].Port)
 	assert.Equal(t, srv1.Meta, val["mysql"].Meta)
-	require.NotNil(t, val["mysql"].Connect)
-	require.NotNil(t, val["mysql"].Connect.Proxy)
-	assert.Equal(t, prxy1.ExecMode.String(), string(val["mysql"].Connect.Proxy.ExecMode))
-	assert.Equal(t, prxy1.Command, val["mysql"].Connect.Proxy.Command)
-	assert.Equal(t, prxy1.Config, val["mysql"].Connect.Proxy.Config)
-	assert.Equal(t, prxy1.Upstreams.ToAPI(), val["mysql"].Connect.Proxy.Upstreams)
+}
+
+func TestAgent_ServicesFiltered(t *testing.T) {
+	t.Parallel()
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+	srv1 := &structs.NodeService{
+		ID:      "mysql",
+		Service: "mysql",
+		Tags:    []string{"master"},
+		Meta: map[string]string{
+			"foo": "bar",
+		},
+		Port: 5000,
+	}
+	require.NoError(t, a.State.AddService(srv1, ""))
+
+	// Add another service
+	srv2 := &structs.NodeService{
+		ID:      "redis",
+		Service: "redis",
+		Tags:    []string{"kv"},
+		Meta: map[string]string{
+			"foo": "bar",
+		},
+		Port: 1234,
+	}
+	require.NoError(t, a.State.AddService(srv2, ""))
+
+	req, _ := http.NewRequest("GET", "/v1/agent/services?filter="+url.QueryEscape("foo in Meta"), nil)
+	obj, err := a.srv.AgentServices(nil, req)
+	require.NoError(t, err)
+	val := obj.(map[string]*api.AgentService)
+	require.Len(t, val, 2)
+
+	req, _ = http.NewRequest("GET", "/v1/agent/services?filter="+url.QueryEscape("kv in Tags"), nil)
+	obj, err = a.srv.AgentServices(nil, req)
+	require.NoError(t, err)
+	val = obj.(map[string]*api.AgentService)
+	require.Len(t, val, 1)
 }
 
 // This tests that the agent services endpoint (/v1/agent/services) returns
@@ -105,7 +128,7 @@ func TestAgent_Services_ExternalConnectProxy(t *testing.T) {
 	t.Parallel()
 
 	assert := assert.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
@@ -129,11 +152,6 @@ func TestAgent_Services_ExternalConnectProxy(t *testing.T) {
 	actual := val["db-proxy"]
 	assert.Equal(api.ServiceKindConnectProxy, actual.Kind)
 	assert.Equal(srv1.Proxy.ToAPI(), actual.Proxy)
-
-	// DEPRECATED (ProxyDestination) - remove the next comment and assertion
-	// Should still have deprecated ProxyDestination filled in until we remove it
-	// completely at a major version bump.
-	assert.Equal(srv1.Proxy.DestinationServiceName, actual.ProxyDestination)
 }
 
 // Thie tests that a sidecar-registered service is returned as expected.
@@ -142,7 +160,7 @@ func TestAgent_Services_Sidecar(t *testing.T) {
 
 	require := require.New(t)
 	assert := assert.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
@@ -170,11 +188,6 @@ func TestAgent_Services_Sidecar(t *testing.T) {
 	assert.Equal(api.ServiceKindConnectProxy, actual.Kind)
 	assert.Equal(srv1.Proxy.ToAPI(), actual.Proxy)
 
-	// DEPRECATED (ProxyDestination) - remove the next comment and assertion
-	// Should still have deprecated ProxyDestination filled in until we remove it
-	// completely at a major version bump.
-	assert.Equal(srv1.Proxy.DestinationServiceName, actual.ProxyDestination)
-
 	// Sanity check that LocalRegisteredAsSidecar is not in the output (assuming
 	// JSON encoding). Right now this is not the case because the services
 	// endpoint happens to use the api struct which doesn't include that field,
@@ -187,9 +200,41 @@ func TestAgent_Services_Sidecar(t *testing.T) {
 	assert.NotContains(string(output), "locally_registered_as_sidecar")
 }
 
+// Thie tests that a mesh gateway service is returned as expected.
+func TestAgent_Services_MeshGateway(t *testing.T) {
+	t.Parallel()
+
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+
+	testrpc.WaitForLeader(t, a.RPC, "dc1")
+	srv1 := &structs.NodeService{
+		Kind:    structs.ServiceKindMeshGateway,
+		ID:      "mg-dc1-01",
+		Service: "mg-dc1",
+		Port:    8443,
+		Proxy: structs.ConnectProxyConfig{
+			Config: map[string]interface{}{
+				"foo": "bar",
+			},
+		},
+	}
+	a.State.AddService(srv1, "")
+
+	req, _ := http.NewRequest("GET", "/v1/agent/services", nil)
+	obj, err := a.srv.AgentServices(nil, req)
+	require.NoError(t, err)
+	val := obj.(map[string]*api.AgentService)
+	require.Len(t, val, 1)
+	actual := val["mg-dc1-01"]
+	require.NotNil(t, actual)
+	require.Equal(t, api.ServiceKindMeshGateway, actual.Kind)
+	require.Equal(t, srv1.Proxy.ToAPI(), actual.Proxy)
+}
+
 func TestAgent_Services_ACLFilter(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
@@ -229,10 +274,16 @@ func TestAgent_Services_ACLFilter(t *testing.T) {
 func TestAgent_Service(t *testing.T) {
 	t.Parallel()
 
-	a := NewTestAgent(t.Name(), TestACLConfig()+`
+	a := NewTestAgent(t, t.Name(), TestACLConfig()+`
 	services {
 		name = "web"
 		port = 8181
+		tagged_addresses {
+			wan {
+				address = "198.18.0.1"
+				port = 1818
+			}
+		}
 	}
 	`)
 	defer a.Shutdown()
@@ -273,28 +324,38 @@ func TestAgent_Service(t *testing.T) {
 		Service:     "web-sidecar-proxy",
 		Port:        8000,
 		Proxy:       expectProxy.ToAPI(),
-		ContentHash: "3442362e971c43d1",
+		ContentHash: "f5826efc5ffc207a",
 		Weights: api.AgentWeights{
 			Passing: 1,
 			Warning: 1,
 		},
+		Meta: map[string]string{},
+		Tags: []string{},
 	}
 
 	// Copy and modify
 	updatedResponse := *expectedResponse
 	updatedResponse.Port = 9999
-	updatedResponse.ContentHash = "90b5c19bf0f5073"
+	updatedResponse.ContentHash = "c8cb04cb77ef33d8"
 
 	// Simple response for non-proxy service registered in TestAgent config
 	expectWebResponse := &api.AgentService{
 		ID:          "web",
 		Service:     "web",
 		Port:        8181,
-		ContentHash: "69351c1ac865b034",
+		ContentHash: "6c247f8ffa5d1fb2",
 		Weights: api.AgentWeights{
 			Passing: 1,
 			Warning: 1,
 		},
+		TaggedAddresses: map[string]api.ServiceAddress{
+			"wan": api.ServiceAddress{
+				Address: "198.18.0.1",
+				Port:    1818,
+			},
+		},
+		Meta: map[string]string{},
+		Tags: []string{},
 	}
 
 	tests := []struct {
@@ -361,10 +422,10 @@ func TestAgent_Service(t *testing.T) {
 			// into a busy-poll!
 			//
 			// This test though doesn't catch that because busy poll still has the
-			// correct external behaviour. I don't want to instrument the loop to
+			// correct external behavior. I don't want to instrument the loop to
 			// assert it's not executing too fast here as I can't think of a clean way
 			// and the issue is fixed now so this test doesn't actually catch the
-			// error, but does provide an easy way to verify the behaviour by hand:
+			// error, but does provide an easy way to verify the behavior by hand:
 			//  1. Make this test fail e.g. change wantErr to true
 			//  2. Add a log.Println or similar into the blocking loop/function
 			//  3. See whether it's called just once or many times in a tight loop.
@@ -488,7 +549,7 @@ func TestAgent_Service(t *testing.T) {
 			}
 			start := time.Now()
 			obj, err := a.srv.AgentService(resp, req)
-			elapsed := time.Now().Sub(start)
+			elapsed := time.Since(start)
 
 			if tt.wantErr != "" {
 				require.Error(err)
@@ -519,89 +580,9 @@ func TestAgent_Service(t *testing.T) {
 	}
 }
 
-// DEPRECATED(managed-proxies) - remove this In the interim, we need the newer
-// /agent/service/service to work for managed proxies so we can swithc the built
-// in proxy to use only that without breaking managed proxies early.
-func TestAgent_Service_DeprecatedManagedProxy(t *testing.T) {
-	t.Parallel()
-	a := NewTestAgent(t.Name(), `
-		connect {
-			proxy {
-				allow_managed_api_registration = true
-			}
-		}
-	`)
-	defer a.Shutdown()
-
-	testrpc.WaitForLeader(t, a.RPC, "dc1")
-
-	svc := &structs.ServiceDefinition{
-		Name: "web",
-		Port: 8000,
-		Check: structs.CheckType{
-			TTL: 10 * time.Second,
-		},
-		Connect: &structs.ServiceConnect{
-			Proxy: &structs.ServiceDefinitionConnectProxy{
-				// Fix the command otherwise the executable path ends up being random
-				// temp dir in every test run so the ContentHash will never match.
-				Command: []string{"foo"},
-				Config: map[string]interface{}{
-					"foo":          "bar",
-					"bind_address": "10.10.10.10",
-					"bind_port":    9999, // make this deterministic
-				},
-				Upstreams: structs.TestUpstreams(t),
-			},
-		},
-	}
-
-	require := require.New(t)
-
-	rr := httptest.NewRecorder()
-
-	req, _ := http.NewRequest("POST", "/v1/agent/services/register", jsonReader(svc))
-	_, err := a.srv.AgentRegisterService(rr, req)
-	require.NoError(err)
-	require.Equal(200, rr.Code, "body:\n"+rr.Body.String())
-
-	rr = httptest.NewRecorder()
-	req, _ = http.NewRequest("GET", "/v1/agent/service/web-proxy", nil)
-	obj, err := a.srv.AgentService(rr, req)
-	require.NoError(err)
-	require.Equal(200, rr.Code, "body:\n"+rr.Body.String())
-
-	gotService, ok := obj.(*api.AgentService)
-	require.True(ok)
-
-	expect := &api.AgentService{
-		Kind:        api.ServiceKindConnectProxy,
-		ID:          "web-proxy",
-		Service:     "web-proxy",
-		Port:        9999,
-		Address:     "10.10.10.10",
-		ContentHash: "e24f099e42e88317",
-		Proxy: &api.AgentServiceConnectProxyConfig{
-			DestinationServiceID:   "web",
-			DestinationServiceName: "web",
-			LocalServiceAddress:    "127.0.0.1",
-			LocalServicePort:       8000,
-			Config: map[string]interface{}{
-				"foo":                   "bar",
-				"bind_port":             9999,
-				"bind_address":          "10.10.10.10",
-				"local_service_address": "127.0.0.1:8000",
-			},
-			Upstreams: structs.TestAddDefaultsToUpstreams(t, svc.Connect.Proxy.Upstreams).ToAPI(),
-		},
-	}
-
-	require.Equal(expect, gotService)
-}
-
 func TestAgent_Checks(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
@@ -627,9 +608,40 @@ func TestAgent_Checks(t *testing.T) {
 	}
 }
 
+func TestAgent_ChecksWithFilter(t *testing.T) {
+	t.Parallel()
+	a := NewTestAgent(t, t.Name(), "")
+	defer a.Shutdown()
+
+	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+	chk1 := &structs.HealthCheck{
+		Node:    a.Config.NodeName,
+		CheckID: "mysql",
+		Name:    "mysql",
+		Status:  api.HealthPassing,
+	}
+	a.State.AddCheck(chk1, "")
+
+	chk2 := &structs.HealthCheck{
+		Node:    a.Config.NodeName,
+		CheckID: "redis",
+		Name:    "redis",
+		Status:  api.HealthPassing,
+	}
+	a.State.AddCheck(chk2, "")
+
+	req, _ := http.NewRequest("GET", "/v1/agent/checks?filter="+url.QueryEscape("Name == `redis`"), nil)
+	obj, err := a.srv.AgentChecks(nil, req)
+	require.NoError(t, err)
+	val := obj.(map[types.CheckID]*structs.HealthCheck)
+	require.Len(t, val, 1)
+	_, ok := val["redis"]
+	require.True(t, ok)
+}
+
 func TestAgent_HealthServiceByID(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -824,7 +836,7 @@ func TestAgent_HealthServiceByID(t *testing.T) {
 
 func TestAgent_HealthServiceByName(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	service := &structs.NodeService{
@@ -1067,7 +1079,7 @@ func TestAgent_HealthServiceByName(t *testing.T) {
 
 func TestAgent_Checks_ACLFilter(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
@@ -1106,7 +1118,7 @@ func TestAgent_Checks_ACLFilter(t *testing.T) {
 
 func TestAgent_Self(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 		node_meta {
 			somekey = "somevalue"
 		}
@@ -1144,7 +1156,7 @@ func TestAgent_Self(t *testing.T) {
 
 func TestAgent_Self_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
@@ -1173,7 +1185,7 @@ func TestAgent_Self_ACLDeny(t *testing.T) {
 
 func TestAgent_Metrics_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
@@ -1203,7 +1215,7 @@ func TestAgent_Metrics_ACLDeny(t *testing.T) {
 func TestAgent_Reload(t *testing.T) {
 	t.Parallel()
 	dc1 := "dc1"
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 		acl_enforce_version_8 = false
 		services = [
 			{
@@ -1275,7 +1287,7 @@ func TestAgent_Reload(t *testing.T) {
 
 func TestAgent_Reload_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
@@ -1302,7 +1314,7 @@ func TestAgent_Reload_ACLDeny(t *testing.T) {
 
 func TestAgent_Members(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
@@ -1323,7 +1335,7 @@ func TestAgent_Members(t *testing.T) {
 
 func TestAgent_Members_WAN(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
@@ -1344,7 +1356,7 @@ func TestAgent_Members_WAN(t *testing.T) {
 
 func TestAgent_Members_ACLFilter(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
@@ -1375,9 +1387,9 @@ func TestAgent_Members_ACLFilter(t *testing.T) {
 
 func TestAgent_Join(t *testing.T) {
 	t.Parallel()
-	a1 := NewTestAgent(t.Name(), "")
+	a1 := NewTestAgent(t, t.Name(), "")
 	defer a1.Shutdown()
-	a2 := NewTestAgent(t.Name(), "")
+	a2 := NewTestAgent(t, t.Name(), "")
 	defer a2.Shutdown()
 	testrpc.WaitForLeader(t, a1.RPC, "dc1")
 	testrpc.WaitForLeader(t, a2.RPC, "dc1")
@@ -1405,9 +1417,9 @@ func TestAgent_Join(t *testing.T) {
 
 func TestAgent_Join_WAN(t *testing.T) {
 	t.Parallel()
-	a1 := NewTestAgent(t.Name(), "")
+	a1 := NewTestAgent(t, t.Name(), "")
 	defer a1.Shutdown()
-	a2 := NewTestAgent(t.Name(), "")
+	a2 := NewTestAgent(t, t.Name(), "")
 	defer a2.Shutdown()
 	testrpc.WaitForLeader(t, a1.RPC, "dc1")
 	testrpc.WaitForLeader(t, a2.RPC, "dc1")
@@ -1435,9 +1447,9 @@ func TestAgent_Join_WAN(t *testing.T) {
 
 func TestAgent_Join_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a1 := NewTestAgent(t.Name(), TestACLConfig())
+	a1 := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a1.Shutdown()
-	a2 := NewTestAgent(t.Name(), "")
+	a2 := NewTestAgent(t, t.Name(), "")
 	defer a2.Shutdown()
 	testrpc.WaitForLeader(t, a1.RPC, "dc1")
 	testrpc.WaitForLeader(t, a2.RPC, "dc1")
@@ -1477,11 +1489,11 @@ func (n *mockNotifier) Notify(state string) error {
 
 func TestAgent_JoinLANNotify(t *testing.T) {
 	t.Parallel()
-	a1 := NewTestAgent(t.Name(), "")
+	a1 := NewTestAgent(t, t.Name(), "")
 	defer a1.Shutdown()
 	testrpc.WaitForLeader(t, a1.RPC, "dc1")
 
-	a2 := NewTestAgent(t.Name(), `
+	a2 := NewTestAgent(t, t.Name(), `
 		server = false
 		bootstrap = false
 	`)
@@ -1503,11 +1515,11 @@ func TestAgent_JoinLANNotify(t *testing.T) {
 
 func TestAgent_Leave(t *testing.T) {
 	t.Parallel()
-	a1 := NewTestAgent(t.Name(), "")
+	a1 := NewTestAgent(t, t.Name(), "")
 	defer a1.Shutdown()
 	testrpc.WaitForLeader(t, a1.RPC, "dc1")
 
-	a2 := NewTestAgent(t.Name(), `
+	a2 := NewTestAgent(t, t.Name(), `
  		server = false
  		bootstrap = false
  	`)
@@ -1539,7 +1551,7 @@ func TestAgent_Leave(t *testing.T) {
 
 func TestAgent_Leave_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -1570,9 +1582,9 @@ func TestAgent_Leave_ACLDeny(t *testing.T) {
 
 func TestAgent_ForceLeave(t *testing.T) {
 	t.Parallel()
-	a1 := NewTestAgent(t.Name(), "")
+	a1 := NewTestAgent(t, t.Name(), "")
 	defer a1.Shutdown()
-	a2 := NewTestAgent(t.Name(), "")
+	a2 := NewTestAgent(t, t.Name(), "")
 	testrpc.WaitForLeader(t, a1.RPC, "dc1")
 	testrpc.WaitForLeader(t, a2.RPC, "dc1")
 
@@ -1613,7 +1625,7 @@ func TestAgent_ForceLeave(t *testing.T) {
 
 func TestAgent_ForceLeave_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -1642,7 +1654,7 @@ func TestAgent_ForceLeave_ACLDeny(t *testing.T) {
 
 func TestAgent_RegisterCheck(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -1685,7 +1697,7 @@ func TestAgent_RegisterCheck(t *testing.T) {
 // support as a result of https://github.com/hashicorp/consul/issues/3587.
 func TestAgent_RegisterCheck_Scripts(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 		enable_script_checks = true
 `)
 	defer a.Shutdown()
@@ -1770,7 +1782,7 @@ func TestAgent_RegisterCheck_Scripts(t *testing.T) {
 
 func TestAgent_RegisterCheckScriptsExecDisable(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -1796,7 +1808,7 @@ func TestAgent_RegisterCheckScriptsExecDisable(t *testing.T) {
 
 func TestAgent_RegisterCheckScriptsExecRemoteDisable(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 		enable_local_script_checks = true
 	`)
 	defer a.Shutdown()
@@ -1824,7 +1836,7 @@ func TestAgent_RegisterCheckScriptsExecRemoteDisable(t *testing.T) {
 
 func TestAgent_RegisterCheck_Passing(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -1860,7 +1872,7 @@ func TestAgent_RegisterCheck_Passing(t *testing.T) {
 
 func TestAgent_RegisterCheck_BadStatus(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -1881,33 +1893,132 @@ func TestAgent_RegisterCheck_BadStatus(t *testing.T) {
 
 func TestAgent_RegisterCheck_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfigNew())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
-	args := &structs.CheckDefinition{
+	nodeCheck := &structs.CheckDefinition{
 		Name: "test",
 		TTL:  15 * time.Second,
 	}
 
-	t.Run("no token", func(t *testing.T) {
-		req, _ := http.NewRequest("PUT", "/v1/agent/check/register", jsonReader(args))
-		if _, err := a.srv.AgentRegisterCheck(nil, req); !acl.IsErrPermissionDenied(err) {
-			t.Fatalf("err: %v", err)
-		}
+	svc := &structs.ServiceDefinition{
+		ID:   "foo:1234",
+		Name: "foo",
+		Port: 1234,
+	}
+
+	svcCheck := &structs.CheckDefinition{
+		Name:      "test2",
+		ServiceID: "foo:1234",
+		TTL:       15 * time.Second,
+	}
+
+	// ensure the service is ready for registering a check for it.
+	req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(svc))
+	resp := httptest.NewRecorder()
+	_, err := a.srv.AgentRegisterService(resp, req)
+	require.NoError(t, err)
+
+	// create a policy that has write on service foo
+	policyReq := &structs.ACLPolicy{
+		Name:  "write-foo",
+		Rules: `service "foo" { policy = "write"}`,
+	}
+
+	req, _ = http.NewRequest("PUT", "/v1/acl/policy?token=root", jsonReader(policyReq))
+	resp = httptest.NewRecorder()
+	_, err = a.srv.ACLPolicyCreate(resp, req)
+	require.NoError(t, err)
+
+	// create a policy that has write on the node name of the agent
+	policyReq = &structs.ACLPolicy{
+		Name:  "write-node",
+		Rules: fmt.Sprintf(`node "%s" { policy = "write" }`, a.config.NodeName),
+	}
+
+	req, _ = http.NewRequest("PUT", "/v1/acl/policy?token=root", jsonReader(policyReq))
+	resp = httptest.NewRecorder()
+	_, err = a.srv.ACLPolicyCreate(resp, req)
+	require.NoError(t, err)
+
+	// create a token using the write-foo policy
+	tokenReq := &structs.ACLToken{
+		Description: "write-foo",
+		Policies: []structs.ACLTokenPolicyLink{
+			structs.ACLTokenPolicyLink{
+				Name: "write-foo",
+			},
+		},
+	}
+
+	req, _ = http.NewRequest("PUT", "/v1/acl/token?token=root", jsonReader(tokenReq))
+	resp = httptest.NewRecorder()
+	tokInf, err := a.srv.ACLTokenCreate(resp, req)
+	require.NoError(t, err)
+	svcToken, ok := tokInf.(*structs.ACLToken)
+	require.True(t, ok)
+	require.NotNil(t, svcToken)
+
+	// create a token using the write-node policy
+	tokenReq = &structs.ACLToken{
+		Description: "write-node",
+		Policies: []structs.ACLTokenPolicyLink{
+			structs.ACLTokenPolicyLink{
+				Name: "write-node",
+			},
+		},
+	}
+
+	req, _ = http.NewRequest("PUT", "/v1/acl/token?token=root", jsonReader(tokenReq))
+	resp = httptest.NewRecorder()
+	tokInf, err = a.srv.ACLTokenCreate(resp, req)
+	require.NoError(t, err)
+	nodeToken, ok := tokInf.(*structs.ACLToken)
+	require.True(t, ok)
+	require.NotNil(t, nodeToken)
+
+	t.Run("no token - node check", func(t *testing.T) {
+		req, _ := http.NewRequest("PUT", "/v1/agent/check/register", jsonReader(nodeCheck))
+		_, err := a.srv.AgentRegisterCheck(nil, req)
+		require.True(t, acl.IsErrPermissionDenied(err))
 	})
 
-	t.Run("root token", func(t *testing.T) {
-		req, _ := http.NewRequest("PUT", "/v1/agent/check/register?token=root", jsonReader(args))
-		if _, err := a.srv.AgentRegisterCheck(nil, req); err != nil {
-			t.Fatalf("err: %v", err)
-		}
+	t.Run("svc token - node check", func(t *testing.T) {
+		req, _ := http.NewRequest("PUT", "/v1/agent/check/register?token="+svcToken.SecretID, jsonReader(nodeCheck))
+		_, err := a.srv.AgentRegisterCheck(nil, req)
+		require.True(t, acl.IsErrPermissionDenied(err))
 	})
+
+	t.Run("node token - node check", func(t *testing.T) {
+		req, _ := http.NewRequest("PUT", "/v1/agent/check/register?token="+nodeToken.SecretID, jsonReader(nodeCheck))
+		_, err := a.srv.AgentRegisterCheck(nil, req)
+		require.NoError(t, err)
+	})
+
+	t.Run("no token - svc check", func(t *testing.T) {
+		req, _ := http.NewRequest("PUT", "/v1/agent/check/register", jsonReader(svcCheck))
+		_, err := a.srv.AgentRegisterCheck(nil, req)
+		require.True(t, acl.IsErrPermissionDenied(err))
+	})
+
+	t.Run("node token - svc check", func(t *testing.T) {
+		req, _ := http.NewRequest("PUT", "/v1/agent/check/register?token="+nodeToken.SecretID, jsonReader(svcCheck))
+		_, err := a.srv.AgentRegisterCheck(nil, req)
+		require.True(t, acl.IsErrPermissionDenied(err))
+	})
+
+	t.Run("svc token - svc check", func(t *testing.T) {
+		req, _ := http.NewRequest("PUT", "/v1/agent/check/register?token="+svcToken.SecretID, jsonReader(svcCheck))
+		_, err := a.srv.AgentRegisterCheck(nil, req)
+		require.NoError(t, err)
+	})
+
 }
 
 func TestAgent_DeregisterCheck(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -1933,7 +2044,7 @@ func TestAgent_DeregisterCheck(t *testing.T) {
 
 func TestAgent_DeregisterCheckACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -1959,7 +2070,7 @@ func TestAgent_DeregisterCheckACLDeny(t *testing.T) {
 
 func TestAgent_PassCheck(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -1987,7 +2098,7 @@ func TestAgent_PassCheck(t *testing.T) {
 
 func TestAgent_PassCheck_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -2014,7 +2125,7 @@ func TestAgent_PassCheck_ACLDeny(t *testing.T) {
 
 func TestAgent_WarnCheck(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -2042,7 +2153,7 @@ func TestAgent_WarnCheck(t *testing.T) {
 
 func TestAgent_WarnCheck_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -2069,7 +2180,7 @@ func TestAgent_WarnCheck_ACLDeny(t *testing.T) {
 
 func TestAgent_FailCheck(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -2097,7 +2208,7 @@ func TestAgent_FailCheck(t *testing.T) {
 
 func TestAgent_FailCheck_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -2124,7 +2235,8 @@ func TestAgent_FailCheck_ACLDeny(t *testing.T) {
 
 func TestAgent_UpdateCheck(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	maxChecksSize := 256
+	a := NewTestAgent(t, t.Name(), fmt.Sprintf("check_output_max_size=%d", maxChecksSize))
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -2165,7 +2277,7 @@ func TestAgent_UpdateCheck(t *testing.T) {
 	t.Run("log output limit", func(t *testing.T) {
 		args := checkUpdate{
 			Status: api.HealthPassing,
-			Output: strings.Repeat("-= bad -=", 5*checks.BufSize),
+			Output: strings.Repeat("-= bad -=", 5*maxChecksSize),
 		}
 		req, _ := http.NewRequest("PUT", "/v1/agent/check/update/test", jsonReader(args))
 		resp := httptest.NewRecorder()
@@ -2184,8 +2296,8 @@ func TestAgent_UpdateCheck(t *testing.T) {
 		// rough check that the output buffer was cut down so this test
 		// isn't super brittle.
 		state := a.State.Checks()["test"]
-		if state.Status != api.HealthPassing || len(state.Output) > 2*checks.BufSize {
-			t.Fatalf("bad: %v", state)
+		if state.Status != api.HealthPassing || len(state.Output) > 2*maxChecksSize {
+			t.Fatalf("bad: %v, (len:=%d)", state, len(state.Output))
 		}
 	})
 
@@ -2208,7 +2320,7 @@ func TestAgent_UpdateCheck(t *testing.T) {
 
 func TestAgent_UpdateCheck_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -2237,7 +2349,7 @@ func TestAgent_UpdateCheck_ACLDeny(t *testing.T) {
 
 func TestAgent_RegisterService(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -2304,34 +2416,49 @@ func TestAgent_RegisterService(t *testing.T) {
 
 func TestAgent_RegisterService_TranslateKeys(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), `
-	connect {
-		proxy {
-			allow_managed_api_registration = true
-		}
+	tests := []struct {
+		ip                    string
+		expectedTCPCheckStart string
+	}{
+		{"127.0.0.1", "127.0.0.1:"}, // private network address
+		{"::1", "[::1]:"},           // shared address space
 	}
+	for _, tt := range tests {
+		t.Run(tt.ip, func(t *testing.T) {
+			a := NewTestAgent(t, t.Name(), `
+	connect {}
 `)
-	defer a.Shutdown()
-	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+			defer a.Shutdown()
+			testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
-	json := `
+			json := `
 	{
 		"name":"test",
 		"port":8000,
 		"enable_tag_override": true,
+		"tagged_addresses": {
+			"lan": {
+				"address": "1.2.3.4",
+				"port": 5353
+			},
+			"wan": {
+				"address": "2.3.4.5",
+				"port": 53
+			}
+		},
 		"meta": {
 			"some": "meta",
 			"enable_tag_override": "meta is 'opaque' so should not get translated"
 		},
 		"kind": "connect-proxy",` +
-		// Note the uppercase P is important here - it ensures translation works
-		// correctly in case-insensitive way. Without it this test can pass even
-		// when translation is broken for other valid inputs.
-		`"Proxy": {
+				// Note the uppercase P is important here - it ensures translation works
+				// correctly in case-insensitive way. Without it this test can pass even
+				// when translation is broken for other valid inputs.
+				`"Proxy": {
 			"destination_service_name": "web",
 			"destination_service_id": "web",
 			"local_service_port": 1234,
-			"local_service_address": "127.0.0.1",
+			"local_service_address": "` + tt.ip + `",
 			"config": {
 				"destination_type": "proxy.config is 'opaque' so should not get translated"
 			},
@@ -2340,7 +2467,7 @@ func TestAgent_RegisterService_TranslateKeys(t *testing.T) {
 					"destination_type": "service",
 					"destination_namespace": "default",
 					"destination_name": "db",
-		      "local_bind_address": "127.0.0.1",
+		      "local_bind_address": "` + tt.ip + `",
 		      "local_bind_port": 1234,
 					"config": {
 						"destination_type": "proxy.upstreams.config is 'opaque' so should not get translated"
@@ -2349,24 +2476,6 @@ func TestAgent_RegisterService_TranslateKeys(t *testing.T) {
 			]
 		},
 		"connect": {
-			"proxy": {
-				"exec_mode": "script",
-				"config": {
-					"destination_type": "connect.proxy.config is 'opaque' so should not get translated"
-				},
-				"upstreams": [
-					{
-						"destination_type": "service",
-						"destination_namespace": "default",
-						"destination_name": "db",
-						"local_bind_address": "127.0.0.1",
-						"local_bind_port": 1234,
-						"config": {
-							"destination_type": "connect.proxy.upstreams.config is 'opaque' so should not get translated"
-						}
-					}
-				]
-			},
 			"sidecar_service": {
 				"name":"test-proxy",
 				"port":8001,
@@ -2380,13 +2489,13 @@ func TestAgent_RegisterService_TranslateKeys(t *testing.T) {
 					"destination_service_name": "test",
 					"destination_service_id": "test",
 					"local_service_port": 4321,
-					"local_service_address": "127.0.0.1",
+					"local_service_address": "` + tt.ip + `",
 					"upstreams": [
 						{
 							"destination_type": "service",
 							"destination_namespace": "default",
 							"destination_name": "db",
-							"local_bind_address": "127.0.0.1",
+							"local_bind_address": "` + tt.ip + `",
 							"local_bind_port": 1234,
 							"config": {
 								"destination_type": "sidecar_service.proxy.upstreams.config is 'opaque' so should not get translated"
@@ -2400,114 +2509,118 @@ func TestAgent_RegisterService_TranslateKeys(t *testing.T) {
 			"passing": 16
 		}
 	}`
-	req, _ := http.NewRequest("PUT", "/v1/agent/service/register", strings.NewReader(json))
+			req, _ := http.NewRequest("PUT", "/v1/agent/service/register", strings.NewReader(json))
 
-	rr := httptest.NewRecorder()
-	obj, err := a.srv.AgentRegisterService(rr, req)
-	require.NoError(t, err)
-	require.Nil(t, obj)
-	require.Equal(t, 200, rr.Code, "body: %s", rr.Body)
+			rr := httptest.NewRecorder()
+			obj, err := a.srv.AgentRegisterService(rr, req)
+			require.NoError(t, err)
+			require.Nil(t, obj)
+			require.Equal(t, 200, rr.Code, "body: %s", rr.Body)
 
-	svc := &structs.NodeService{
-		ID:      "test",
-		Service: "test",
-		Meta: map[string]string{
-			"some":                "meta",
-			"enable_tag_override": "meta is 'opaque' so should not get translated",
-		},
-		Port:              8000,
-		EnableTagOverride: true,
-		Weights:           &structs.Weights{Passing: 16, Warning: 0},
-		Kind:              structs.ServiceKindConnectProxy,
-		Proxy: structs.ConnectProxyConfig{
-			DestinationServiceName: "web",
-			DestinationServiceID:   "web",
-			LocalServiceAddress:    "127.0.0.1",
-			LocalServicePort:       1234,
-			Config: map[string]interface{}{
-				"destination_type": "proxy.config is 'opaque' so should not get translated",
-			},
-			Upstreams: structs.Upstreams{
-				{
-					DestinationType:      structs.UpstreamDestTypeService,
-					DestinationName:      "db",
-					DestinationNamespace: "default",
-					LocalBindAddress:     "127.0.0.1",
-					LocalBindPort:        1234,
-					Config: map[string]interface{}{
-						"destination_type": "proxy.upstreams.config is 'opaque' so should not get translated",
+			svc := &structs.NodeService{
+				ID:      "test",
+				Service: "test",
+				TaggedAddresses: map[string]structs.ServiceAddress{
+					"lan": {
+						Address: "1.2.3.4",
+						Port:    5353,
+					},
+					"wan": {
+						Address: "2.3.4.5",
+						Port:    53,
 					},
 				},
-			},
-		},
-		Connect: structs.ServiceConnect{
-			Proxy: &structs.ServiceDefinitionConnectProxy{
-				ExecMode: "script",
-				Config: map[string]interface{}{
-					"destination_type": "connect.proxy.config is 'opaque' so should not get translated",
+				Meta: map[string]string{
+					"some":                "meta",
+					"enable_tag_override": "meta is 'opaque' so should not get translated",
 				},
-				Upstreams: structs.Upstreams{
-					{
-						DestinationType:      structs.UpstreamDestTypeService,
-						DestinationName:      "db",
-						DestinationNamespace: "default",
-						LocalBindAddress:     "127.0.0.1",
-						LocalBindPort:        1234,
-						Config: map[string]interface{}{
-							"destination_type": "connect.proxy.upstreams.config is 'opaque' so should not get translated",
+				Port:              8000,
+				EnableTagOverride: true,
+				Weights:           &structs.Weights{Passing: 16, Warning: 0},
+				Kind:              structs.ServiceKindConnectProxy,
+				Proxy: structs.ConnectProxyConfig{
+					DestinationServiceName: "web",
+					DestinationServiceID:   "web",
+					LocalServiceAddress:    tt.ip,
+					LocalServicePort:       1234,
+					Config: map[string]interface{}{
+						"destination_type": "proxy.config is 'opaque' so should not get translated",
+					},
+					Upstreams: structs.Upstreams{
+						{
+							DestinationType:      structs.UpstreamDestTypeService,
+							DestinationName:      "db",
+							DestinationNamespace: "default",
+							LocalBindAddress:     tt.ip,
+							LocalBindPort:        1234,
+							Config: map[string]interface{}{
+								"destination_type": "proxy.upstreams.config is 'opaque' so should not get translated",
+							},
 						},
 					},
 				},
-			},
-			// The sidecar service is nilled since it is only config sugar and
-			// shouldn't be represented in state. We assert that the translations
-			// there worked by inspecting the registered sidecar below.
-			SidecarService: nil,
-		},
-	}
+				Connect: structs.ServiceConnect{
+					// The sidecar service is nilled since it is only config sugar and
+					// shouldn't be represented in state. We assert that the translations
+					// there worked by inspecting the registered sidecar below.
+					SidecarService: nil,
+				},
+			}
 
-	got := a.State.Service("test")
-	require.Equal(t, svc, got)
+			got := a.State.Service("test")
+			require.Equal(t, svc, got)
 
-	sidecarSvc := &structs.NodeService{
-		Kind:    structs.ServiceKindConnectProxy,
-		ID:      "test-sidecar-proxy",
-		Service: "test-proxy",
-		Meta: map[string]string{
-			"some":                "meta",
-			"enable_tag_override": "sidecar_service.meta is 'opaque' so should not get translated",
-		},
-		Port:                       8001,
-		EnableTagOverride:          true,
-		Weights:                    &structs.Weights{Passing: 1, Warning: 1},
-		LocallyRegisteredAsSidecar: true,
-		Proxy: structs.ConnectProxyConfig{
-			DestinationServiceName: "test",
-			DestinationServiceID:   "test",
-			LocalServiceAddress:    "127.0.0.1",
-			LocalServicePort:       4321,
-			Upstreams: structs.Upstreams{
-				{
-					DestinationType:      structs.UpstreamDestTypeService,
-					DestinationName:      "db",
-					DestinationNamespace: "default",
-					LocalBindAddress:     "127.0.0.1",
-					LocalBindPort:        1234,
-					Config: map[string]interface{}{
-						"destination_type": "sidecar_service.proxy.upstreams.config is 'opaque' so should not get translated",
+			sidecarSvc := &structs.NodeService{
+				Kind:    structs.ServiceKindConnectProxy,
+				ID:      "test-sidecar-proxy",
+				Service: "test-proxy",
+				Meta: map[string]string{
+					"some":                "meta",
+					"enable_tag_override": "sidecar_service.meta is 'opaque' so should not get translated",
+				},
+				Port:                       8001,
+				EnableTagOverride:          true,
+				Weights:                    &structs.Weights{Passing: 1, Warning: 1},
+				LocallyRegisteredAsSidecar: true,
+				Proxy: structs.ConnectProxyConfig{
+					DestinationServiceName: "test",
+					DestinationServiceID:   "test",
+					LocalServiceAddress:    tt.ip,
+					LocalServicePort:       4321,
+					Upstreams: structs.Upstreams{
+						{
+							DestinationType:      structs.UpstreamDestTypeService,
+							DestinationName:      "db",
+							DestinationNamespace: "default",
+							LocalBindAddress:     tt.ip,
+							LocalBindPort:        1234,
+							Config: map[string]interface{}{
+								"destination_type": "sidecar_service.proxy.upstreams.config is 'opaque' so should not get translated",
+							},
+						},
 					},
 				},
-			},
-		},
+			}
+			gotSidecar := a.State.Service("test-sidecar-proxy")
+			hasNoCorrectTCPCheck := true
+			for _, v := range a.checkTCPs {
+				if strings.HasPrefix(v.TCP, tt.expectedTCPCheckStart) {
+					hasNoCorrectTCPCheck = false
+					break
+				}
+				fmt.Println("TCP Check:= ", v)
+			}
+			if hasNoCorrectTCPCheck {
+				t.Fatalf("Did not find the expected TCP Healtcheck '%s' in %#v ", tt.expectedTCPCheckStart, a.checkTCPs)
+			}
+			require.Equal(t, sidecarSvc, gotSidecar)
+		})
 	}
-
-	gotSidecar := a.State.Service("test-sidecar-proxy")
-	require.Equal(t, sidecarSvc, gotSidecar)
 }
 
 func TestAgent_RegisterService_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -2545,7 +2658,7 @@ func TestAgent_RegisterService_ACLDeny(t *testing.T) {
 
 func TestAgent_RegisterService_InvalidAddress(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -2572,220 +2685,14 @@ func TestAgent_RegisterService_InvalidAddress(t *testing.T) {
 	}
 }
 
-// This tests local agent service registration with a managed proxy.
-func TestAgent_RegisterService_ManagedConnectProxy(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-	a := NewTestAgent(t.Name(), `
-		connect {
-			proxy {
-				allow_managed_api_registration = true
-			}
-		}
-	`)
-	defer a.Shutdown()
-	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
-
-	// Register a proxy. Note that the destination doesn't exist here on
-	// this agent or in the catalog at all. This is intended and part
-	// of the design.
-	args := &api.AgentServiceRegistration{
-		Name: "web",
-		Port: 8000,
-		Connect: &api.AgentServiceConnect{
-			Proxy: &api.AgentServiceConnectProxy{
-				ExecMode: "script",
-				Command:  []string{"proxy.sh"},
-				Config: map[string]interface{}{
-					"foo": "bar",
-				},
-				// Includes an upstream with missing defaulted type
-				Upstreams: structs.TestUpstreams(t).ToAPI(),
-			},
-		},
-	}
-
-	req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=abc123", jsonReader(args))
-	resp := httptest.NewRecorder()
-	obj, err := a.srv.AgentRegisterService(resp, req)
-	assert.NoError(err)
-	assert.Nil(obj)
-	require.Equal(200, resp.Code, "request failed with body: %s",
-		resp.Body.String())
-
-	// Ensure the target service
-	_, ok := a.State.Services()["web"]
-	assert.True(ok, "has service")
-
-	// Ensure the proxy service was registered
-	proxySvc, ok := a.State.Services()["web-proxy"]
-	require.True(ok, "has proxy service")
-	assert.Equal(structs.ServiceKindConnectProxy, proxySvc.Kind)
-	assert.Equal("web", proxySvc.Proxy.DestinationServiceName)
-	assert.NotEmpty(proxySvc.Port, "a port should have been assigned")
-
-	// Ensure proxy itself was registered
-	proxy := a.State.Proxy("web-proxy")
-	require.NotNil(proxy)
-	assert.Equal(structs.ProxyExecModeScript, proxy.Proxy.ExecMode)
-	assert.Equal([]string{"proxy.sh"}, proxy.Proxy.Command)
-	assert.Equal(args.Connect.Proxy.Config, proxy.Proxy.Config)
-	// Unsure the defaulted type is explicitly filled
-	args.Connect.Proxy.Upstreams[0].DestinationType = api.UpstreamDestTypeService
-	assert.Equal(args.Connect.Proxy.Upstreams,
-		proxy.Proxy.Upstreams.ToAPI())
-
-	// Ensure the token was configured
-	assert.Equal("abc123", a.State.ServiceToken("web"))
-	assert.Equal("abc123", a.State.ServiceToken("web-proxy"))
-}
-
-// This tests local agent service registration with a managed proxy using
-// original deprecated upstreams syntax.
-func TestAgent_RegisterService_ManagedConnectProxyDeprecated(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-	a := NewTestAgent(t.Name(), `
-		connect {
-			proxy {
-				allow_managed_api_registration = true
-			}
-		}
-	`)
-	defer a.Shutdown()
-	testrpc.WaitForLeader(t, a.RPC, "dc1")
-
-	// Register a proxy. Note that the destination doesn't exist here on
-	// this agent or in the catalog at all. This is intended and part
-	// of the design.
-	args := &api.AgentServiceRegistration{
-		Name: "web",
-		Port: 8000,
-		Connect: &api.AgentServiceConnect{
-			Proxy: &api.AgentServiceConnectProxy{
-				ExecMode: "script",
-				Command:  []string{"proxy.sh"},
-				Config: map[string]interface{}{
-					"foo": "bar",
-					"upstreams": []interface{}{
-						map[string]interface{}{
-							"destination_name": "db",
-							"local_bind_port":  1234,
-							// this was a field for old upstreams we don't support any more.
-							// It should be copied into Upstreams' Config.
-							"connect_timeout_ms": 1000,
-						},
-						map[string]interface{}{
-							"destination_name": "geo-cache",
-							"destination_type": "prepared_query",
-							"local_bind_port":  1235,
-						},
-					},
-				},
-			},
-		},
-	}
-
-	req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=abc123", jsonReader(args))
-	resp := httptest.NewRecorder()
-	obj, err := a.srv.AgentRegisterService(resp, req)
-	assert.NoError(err)
-	assert.Nil(obj)
-	require.Equal(200, resp.Code, "request failed with body: %s",
-		resp.Body.String())
-
-	// Ensure the target service
-	_, ok := a.State.Services()["web"]
-	assert.True(ok, "has service")
-
-	// Ensure the proxy service was registered
-	proxySvc, ok := a.State.Services()["web-proxy"]
-	require.True(ok, "has proxy service")
-	assert.Equal(structs.ServiceKindConnectProxy, proxySvc.Kind)
-	assert.Equal("web", proxySvc.Proxy.DestinationServiceName)
-	assert.NotEmpty(proxySvc.Port, "a port should have been assigned")
-
-	// Ensure proxy itself was registered
-	proxy := a.State.Proxy("web-proxy")
-	require.NotNil(proxy)
-	assert.Equal(structs.ProxyExecModeScript, proxy.Proxy.ExecMode)
-	assert.Equal([]string{"proxy.sh"}, proxy.Proxy.Command)
-	// Remove the upstreams from the args - we expect them not to show up in
-	// response now since that moved.
-	delete(args.Connect.Proxy.Config, "upstreams")
-	assert.Equal(args.Connect.Proxy.Config, proxy.Proxy.Config)
-	expectUpstreams := structs.Upstreams{
-		{
-			DestinationType: structs.UpstreamDestTypeService,
-			DestinationName: "db",
-			LocalBindPort:   1234,
-			Config: map[string]interface{}{
-				"connect_timeout_ms": float64(1000),
-			},
-		},
-		{
-			DestinationType: structs.UpstreamDestTypePreparedQuery,
-			DestinationName: "geo-cache",
-			LocalBindPort:   1235,
-		},
-	}
-	assert.Equal(expectUpstreams, proxy.Proxy.Upstreams)
-
-	// Ensure the token was configured
-	assert.Equal("abc123", a.State.ServiceToken("web"))
-	assert.Equal("abc123", a.State.ServiceToken("web-proxy"))
-}
-
-// This tests local agent service registration with a managed proxy with
-// API registration disabled (default).
-func TestAgent_RegisterService_ManagedConnectProxy_Disabled(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	a := NewTestAgent(t.Name(), ``)
-	defer a.Shutdown()
-	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
-
-	// Register a proxy. Note that the destination doesn't exist here on
-	// this agent or in the catalog at all. This is intended and part
-	// of the design.
-	args := &api.AgentServiceRegistration{
-		Name: "web",
-		Port: 8000,
-		Connect: &api.AgentServiceConnect{
-			Proxy: &api.AgentServiceConnectProxy{
-				ExecMode: "script",
-				Command:  []string{"proxy.sh"},
-				Config: map[string]interface{}{
-					"foo": "bar",
-				},
-			},
-		},
-	}
-
-	req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=abc123", jsonReader(args))
-	resp := httptest.NewRecorder()
-	_, err := a.srv.AgentRegisterService(resp, req)
-	assert.Error(err)
-
-	// Ensure the target service does not exist
-	_, ok := a.State.Services()["web"]
-	assert.False(ok, "does not has service")
-}
-
 // This tests local agent service registration of a unmanaged connect proxy.
 // This verifies that it is put in the local state store properly for syncing
-// later. Note that _managed_ connect proxies are registered as part of the
-// target service's registration.
+// later.
 func TestAgent_RegisterService_UnmanagedConnectProxy(t *testing.T) {
 	t.Parallel()
 
 	assert := assert.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -2795,8 +2702,6 @@ func TestAgent_RegisterService_UnmanagedConnectProxy(t *testing.T) {
 		Kind: api.ServiceKindConnectProxy,
 		Name: "connect-proxy",
 		Port: 8000,
-		// DEPRECATED (ProxyDestination) - remove this when removing ProxyDestination
-		ProxyDestination: "bad_destination", // Deprecated, check it's overridden
 		Proxy: &api.AgentServiceConnectProxyConfig{
 			DestinationServiceName: "web",
 			Upstreams: []api.Upstream{
@@ -2860,18 +2765,42 @@ func testDefaultSidecar(svc string, port int, fns ...func(*structs.NodeService))
 	return ns
 }
 
+// testCreateToken creates a Policy for the provided rules and a Token linked to that Policy.
 func testCreateToken(t *testing.T, a *TestAgent, rules string) string {
+	policyName, err := uuid.GenerateUUID() // we just need a unique name for the test and UUIDs are definitely unique
+	require.NoError(t, err)
+
+	policyID := testCreatePolicy(t, a, policyName, rules)
+
 	args := map[string]interface{}{
-		"Name":  "User Token",
-		"Type":  "client",
-		"Rules": rules,
+		"Name": "User Token",
+		"Policies": []map[string]interface{}{
+			map[string]interface{}{
+				"ID": policyID,
+			},
+		},
+		"Local": false,
 	}
-	req, _ := http.NewRequest("PUT", "/v1/acl/create?token=root", jsonReader(args))
+	req, _ := http.NewRequest("PUT", "/v1/acl/token?token=root", jsonReader(args))
 	resp := httptest.NewRecorder()
-	obj, err := a.srv.ACLCreate(resp, req)
+	obj, err := a.srv.ACLTokenCreate(resp, req)
 	require.NoError(t, err)
 	require.NotNil(t, obj)
-	aclResp := obj.(aclCreateResponse)
+	aclResp := obj.(*structs.ACLToken)
+	return aclResp.SecretID
+}
+
+func testCreatePolicy(t *testing.T, a *TestAgent, name, rules string) string {
+	args := map[string]interface{}{
+		"Name":  name,
+		"Rules": rules,
+	}
+	req, _ := http.NewRequest("PUT", "/v1/acl/policy?token=root", jsonReader(args))
+	resp := httptest.NewRecorder()
+	obj, err := a.srv.ACLPolicyCreate(resp, req)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	aclResp := obj.(*structs.ACLPolicy)
 	return aclResp.ID
 }
 
@@ -2936,6 +2865,9 @@ func TestAgent_RegisterServiceDeregisterService_Sidecar(t *testing.T) {
 			`,
 			enableACL: true,
 			tokenRules: `
+			service "web-sidecar-proxy" {
+				policy = "write"
+			}
 			service "web" {
 				policy = "write"
 			}`,
@@ -2982,7 +2914,7 @@ func TestAgent_RegisterServiceDeregisterService_Sidecar(t *testing.T) {
 			wantErr: "Permission denied",
 		},
 		{
-			name: "ACL OK for service and sidecar but not sidecar's overriden destination",
+			name: "ACL OK for service and sidecar but not sidecar's overridden destination",
 			json: `
 			{
 				"name": "web",
@@ -2998,6 +2930,9 @@ func TestAgent_RegisterServiceDeregisterService_Sidecar(t *testing.T) {
 			`,
 			enableACL: true,
 			tokenRules: `
+			service "web-sidecar-proxy" {
+				policy = "write"
+			}
 			service "web" {
 				policy = "write"
 			}`,
@@ -3019,6 +2954,9 @@ func TestAgent_RegisterServiceDeregisterService_Sidecar(t *testing.T) {
 			`,
 			enableACL: true,
 			tokenRules: `
+			service "web-sidecar-proxy" {
+				policy = "write"
+			}
 			service "web" {
 				policy = "write"
 			}`,
@@ -3028,7 +2966,7 @@ func TestAgent_RegisterServiceDeregisterService_Sidecar(t *testing.T) {
 		{
 			name: "ACL OK for service but and overridden for sidecar",
 			// This test ensures that if the sidecar embeds it's own token with
-			// differnt privs from the main request token it will be honoured for the
+			// different privs from the main request token it will be honored for the
 			// sidecar registration. We use the test root token since that should have
 			// permission.
 			json: `
@@ -3045,6 +2983,9 @@ func TestAgent_RegisterServiceDeregisterService_Sidecar(t *testing.T) {
 			`,
 			enableACL: true,
 			tokenRules: `
+			service "web-sidecar-proxy" {
+				policy = "write"
+			}
 			service "web" {
 				policy = "write"
 			}`,
@@ -3113,7 +3054,7 @@ func TestAgent_RegisterServiceDeregisterService_Sidecar(t *testing.T) {
 			wantErr: "Status for checks must 'passing', 'warning', 'critical'",
 		},
 		{
-			name: "invalid checkS status in sidecar",
+			name: "invalid checks status in sidecar",
 			// Note no interval in the TCP check should fail validation
 			json: `
 			{
@@ -3252,7 +3193,7 @@ func TestAgent_RegisterServiceDeregisterService_Sidecar(t *testing.T) {
 				hcl = hcl + TestACLConfig()
 			}
 
-			a := NewTestAgent(t.Name(), hcl)
+			a := NewTestAgent(t, t.Name(), hcl)
 			defer a.Shutdown()
 			testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -3304,7 +3245,7 @@ func TestAgent_RegisterServiceDeregisterService_Sidecar(t *testing.T) {
 			assert.Equal(sd.Port, svc.Port)
 			// Ensure that the actual registered service _doesn't_ still have it's
 			// sidecar info since it's duplicate and we don't want that synced up to
-			// the catalog or included in responses particulary - it's just
+			// the catalog or included in responses particularly - it's just
 			// registration syntax sugar.
 			assert.Nil(svc.Connect.SidecarService)
 
@@ -3353,7 +3294,7 @@ func TestAgent_RegisterService_UnmanagedConnectProxyInvalid(t *testing.T) {
 	t.Parallel()
 
 	assert := assert.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -3386,7 +3327,7 @@ func TestAgent_RegisterService_ConnectNative(t *testing.T) {
 	t.Parallel()
 
 	assert := assert.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -3418,7 +3359,7 @@ func TestAgent_RegisterService_ConnectNative(t *testing.T) {
 
 func TestAgent_RegisterService_ScriptCheck_ExecDisable(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -3454,7 +3395,7 @@ func TestAgent_RegisterService_ScriptCheck_ExecDisable(t *testing.T) {
 
 func TestAgent_RegisterService_ScriptCheck_ExecRemoteDisable(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 		enable_local_script_checks = true
 	`)
 	defer a.Shutdown()
@@ -3492,7 +3433,7 @@ func TestAgent_RegisterService_ScriptCheck_ExecRemoteDisable(t *testing.T) {
 
 func TestAgent_DeregisterService(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -3525,7 +3466,7 @@ func TestAgent_DeregisterService(t *testing.T) {
 
 func TestAgent_DeregisterService_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -3552,113 +3493,9 @@ func TestAgent_DeregisterService_ACLDeny(t *testing.T) {
 	})
 }
 
-func TestAgent_DeregisterService_withManagedProxy(t *testing.T) {
-	t.Parallel()
-	require := require.New(t)
-	a := NewTestAgent(t.Name(), `
-		connect {
-			proxy {
-				allow_managed_api_registration = true
-			}
-		}
-		`)
-
-	defer a.Shutdown()
-	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
-
-	// Register a service with a managed proxy
-	{
-		reg := &structs.ServiceDefinition{
-			ID:      "test-id",
-			Name:    "test",
-			Address: "127.0.0.1",
-			Port:    8000,
-			Check: structs.CheckType{
-				TTL: 15 * time.Second,
-			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
-		}
-
-		req, _ := http.NewRequest("PUT", "/v1/agent/service/register", jsonReader(reg))
-		resp := httptest.NewRecorder()
-		_, err := a.srv.AgentRegisterService(resp, req)
-		require.NoError(err)
-		require.Equal(200, resp.Code, "body: %s", resp.Body.String())
-	}
-
-	// Get the proxy ID
-	require.Len(a.State.Proxies(), 1)
-	var proxyID string
-	for _, p := range a.State.Proxies() {
-		proxyID = p.Proxy.ProxyService.ID
-	}
-
-	req, _ := http.NewRequest("PUT", "/v1/agent/service/deregister/test-id", nil)
-	obj, err := a.srv.AgentDeregisterService(nil, req)
-	require.NoError(err)
-	require.Nil(obj)
-
-	// Ensure we have no service, check, managed proxy, or proxy service
-	require.NotContains(a.State.Services(), "test-id")
-	require.NotContains(a.State.Checks(), "test-id")
-	require.NotContains(a.State.Services(), proxyID)
-	require.Len(a.State.Proxies(), 0)
-}
-
-// Test that we can't deregister a managed proxy service directly.
-func TestAgent_DeregisterService_managedProxyDirect(t *testing.T) {
-	t.Parallel()
-	require := require.New(t)
-	a := NewTestAgent(t.Name(), `
-		connect {
-			proxy {
-				allow_managed_api_registration = true
-			}
-		}
-		`)
-
-	defer a.Shutdown()
-	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
-
-	// Register a service with a managed proxy
-	{
-		reg := &structs.ServiceDefinition{
-			ID:      "test-id",
-			Name:    "test",
-			Address: "127.0.0.1",
-			Port:    8000,
-			Check: structs.CheckType{
-				TTL: 15 * time.Second,
-			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
-		}
-
-		req, _ := http.NewRequest("PUT", "/v1/agent/service/register", jsonReader(reg))
-		resp := httptest.NewRecorder()
-		_, err := a.srv.AgentRegisterService(resp, req)
-		require.NoError(err)
-		require.Equal(200, resp.Code, "body: %s", resp.Body.String())
-	}
-
-	// Get the proxy ID
-	var proxyID string
-	for _, p := range a.State.Proxies() {
-		proxyID = p.Proxy.ProxyService.ID
-	}
-
-	req, _ := http.NewRequest("PUT", "/v1/agent/service/deregister/"+proxyID, nil)
-	obj, err := a.srv.AgentDeregisterService(nil, req)
-	require.Error(err)
-	require.Nil(obj)
-}
-
 func TestAgent_ServiceMaintenance_BadRequest(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -3698,7 +3535,7 @@ func TestAgent_ServiceMaintenance_BadRequest(t *testing.T) {
 
 func TestAgent_ServiceMaintenance_Enable(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -3741,7 +3578,7 @@ func TestAgent_ServiceMaintenance_Enable(t *testing.T) {
 
 func TestAgent_ServiceMaintenance_Disable(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -3778,7 +3615,7 @@ func TestAgent_ServiceMaintenance_Disable(t *testing.T) {
 
 func TestAgent_ServiceMaintenance_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -3808,7 +3645,7 @@ func TestAgent_ServiceMaintenance_ACLDeny(t *testing.T) {
 
 func TestAgent_NodeMaintenance_BadRequest(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -3825,7 +3662,7 @@ func TestAgent_NodeMaintenance_BadRequest(t *testing.T) {
 
 func TestAgent_NodeMaintenance_Enable(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -3858,7 +3695,7 @@ func TestAgent_NodeMaintenance_Enable(t *testing.T) {
 
 func TestAgent_NodeMaintenance_Disable(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -3883,7 +3720,7 @@ func TestAgent_NodeMaintenance_Disable(t *testing.T) {
 
 func TestAgent_NodeMaintenance_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -3904,7 +3741,7 @@ func TestAgent_NodeMaintenance_ACLDeny(t *testing.T) {
 
 func TestAgent_RegisterCheck_Service(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -3955,8 +3792,9 @@ func TestAgent_Monitor(t *testing.T) {
 		Name:      t.Name(),
 		LogWriter: logWriter,
 		LogOutput: io.MultiWriter(os.Stderr, logWriter),
+		HCL:       `node_name = "invalid!"`,
 	}
-	a.Start()
+	a.Start(t)
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -3990,7 +3828,7 @@ func TestAgent_Monitor(t *testing.T) {
 		<-done
 
 		got := resp.Body.Bytes()
-		want := []byte("raft: Initial configuration (index=1)")
+		want := []byte(`[WARN] agent: Node name "invalid!" will not be discoverable via DNS`)
 		if !bytes.Contains(got, want) {
 			r.Fatalf("got %q and did not find %q", got, want)
 		}
@@ -4018,7 +3856,7 @@ func (r *closableRecorder) CloseNotify() <-chan bool {
 
 func TestAgent_Monitor_ACLDeny(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -4040,23 +3878,35 @@ func TestAgent_Token(t *testing.T) {
 	// The behavior of this handler when ACLs are disabled is vetted over
 	// in TestACL_Disabled_Response since there's already good infra set
 	// up over there to test this, and it calls the common function.
-	a := NewTestAgent(t.Name(), TestACLConfig()+`
-		acl_token = ""
-		acl_agent_token = ""
-		acl_agent_master_token = ""
+	a := NewTestAgent(t, t.Name(), TestACLConfig()+`
+		acl {
+			tokens {
+				default = ""
+				agent = ""
+				agent_master = ""
+				replication = ""
+			}
+		}
 	`)
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
 	type tokens struct {
-		user, agent, master, repl string
+		user         string
+		userSource   tokenStore.TokenSource
+		agent        string
+		agentSource  tokenStore.TokenSource
+		master       string
+		masterSource tokenStore.TokenSource
+		repl         string
+		replSource   tokenStore.TokenSource
 	}
 
-	resetTokens := func(got tokens) {
-		a.tokens.UpdateUserToken(got.user)
-		a.tokens.UpdateAgentToken(got.agent)
-		a.tokens.UpdateAgentMasterToken(got.master)
-		a.tokens.UpdateACLReplicationToken(got.repl)
+	resetTokens := func(init tokens) {
+		a.tokens.UpdateUserToken(init.user, init.userSource)
+		a.tokens.UpdateAgentToken(init.agent, init.agentSource)
+		a.tokens.UpdateAgentMasterToken(init.master, init.masterSource)
+		a.tokens.UpdateReplicationToken(init.repl, init.replSource)
 	}
 
 	body := func(token string) io.Reader {
@@ -4072,7 +3922,9 @@ func TestAgent_Token(t *testing.T) {
 		method, url string
 		body        io.Reader
 		code        int
-		got, want   tokens
+		init        tokens
+		raw         tokens
+		effective   tokens
 	}{
 		{
 			name:   "bad token name",
@@ -4089,95 +3941,181 @@ func TestAgent_Token(t *testing.T) {
 			code:   http.StatusBadRequest,
 		},
 		{
-			name:   "set user",
-			method: "PUT",
-			url:    "acl_token?token=root",
-			body:   body("U"),
-			code:   http.StatusOK,
-			want:   tokens{user: "U", agent: "U"},
+			name:      "set user legacy",
+			method:    "PUT",
+			url:       "acl_token?token=root",
+			body:      body("U"),
+			code:      http.StatusOK,
+			raw:       tokens{user: "U", userSource: tokenStore.TokenSourceAPI},
+			effective: tokens{user: "U", agent: "U"},
 		},
 		{
-			name:   "set agent",
-			method: "PUT",
-			url:    "acl_agent_token?token=root",
-			body:   body("A"),
-			code:   http.StatusOK,
-			got:    tokens{user: "U", agent: "U"},
-			want:   tokens{user: "U", agent: "A"},
+			name:      "set default",
+			method:    "PUT",
+			url:       "default?token=root",
+			body:      body("U"),
+			code:      http.StatusOK,
+			raw:       tokens{user: "U", userSource: tokenStore.TokenSourceAPI},
+			effective: tokens{user: "U", agent: "U"},
 		},
 		{
-			name:   "set master",
-			method: "PUT",
-			url:    "acl_agent_master_token?token=root",
-			body:   body("M"),
-			code:   http.StatusOK,
-			want:   tokens{master: "M"},
+			name:      "set agent legacy",
+			method:    "PUT",
+			url:       "acl_agent_token?token=root",
+			body:      body("A"),
+			code:      http.StatusOK,
+			init:      tokens{user: "U", agent: "U"},
+			raw:       tokens{user: "U", agent: "A", agentSource: tokenStore.TokenSourceAPI},
+			effective: tokens{user: "U", agent: "A"},
 		},
 		{
-			name:   "set repl",
-			method: "PUT",
-			url:    "acl_replication_token?token=root",
-			body:   body("R"),
-			code:   http.StatusOK,
-			want:   tokens{repl: "R"},
+			name:      "set agent",
+			method:    "PUT",
+			url:       "agent?token=root",
+			body:      body("A"),
+			code:      http.StatusOK,
+			init:      tokens{user: "U", agent: "U"},
+			raw:       tokens{user: "U", agent: "A", agentSource: tokenStore.TokenSourceAPI},
+			effective: tokens{user: "U", agent: "A"},
 		},
 		{
-			name:   "clear user",
+			name:      "set master legacy",
+			method:    "PUT",
+			url:       "acl_agent_master_token?token=root",
+			body:      body("M"),
+			code:      http.StatusOK,
+			raw:       tokens{master: "M", masterSource: tokenStore.TokenSourceAPI},
+			effective: tokens{master: "M"},
+		},
+		{
+			name:      "set master ",
+			method:    "PUT",
+			url:       "agent_master?token=root",
+			body:      body("M"),
+			code:      http.StatusOK,
+			raw:       tokens{master: "M", masterSource: tokenStore.TokenSourceAPI},
+			effective: tokens{master: "M"},
+		},
+		{
+			name:      "set repl legacy",
+			method:    "PUT",
+			url:       "acl_replication_token?token=root",
+			body:      body("R"),
+			code:      http.StatusOK,
+			raw:       tokens{repl: "R", replSource: tokenStore.TokenSourceAPI},
+			effective: tokens{repl: "R"},
+		},
+		{
+			name:      "set repl",
+			method:    "PUT",
+			url:       "replication?token=root",
+			body:      body("R"),
+			code:      http.StatusOK,
+			raw:       tokens{repl: "R", replSource: tokenStore.TokenSourceAPI},
+			effective: tokens{repl: "R"},
+		},
+		{
+			name:   "clear user legacy",
 			method: "PUT",
 			url:    "acl_token?token=root",
 			body:   body(""),
 			code:   http.StatusOK,
-			got:    tokens{user: "U"},
+			init:   tokens{user: "U"},
+			raw:    tokens{userSource: tokenStore.TokenSourceAPI},
+		},
+		{
+			name:   "clear default",
+			method: "PUT",
+			url:    "default?token=root",
+			body:   body(""),
+			code:   http.StatusOK,
+			init:   tokens{user: "U"},
+			raw:    tokens{userSource: tokenStore.TokenSourceAPI},
+		},
+		{
+			name:   "clear agent legacy",
+			method: "PUT",
+			url:    "acl_agent_token?token=root",
+			body:   body(""),
+			code:   http.StatusOK,
+			init:   tokens{agent: "A"},
+			raw:    tokens{agentSource: tokenStore.TokenSourceAPI},
 		},
 		{
 			name:   "clear agent",
 			method: "PUT",
-			url:    "acl_agent_token?token=root",
+			url:    "agent?token=root",
 			body:   body(""),
 			code:   http.StatusOK,
-			got:    tokens{agent: "A"},
+			init:   tokens{agent: "A"},
+			raw:    tokens{agentSource: tokenStore.TokenSourceAPI},
 		},
 		{
-			name:   "clear master",
+			name:   "clear master legacy",
 			method: "PUT",
 			url:    "acl_agent_master_token?token=root",
 			body:   body(""),
 			code:   http.StatusOK,
-			got:    tokens{master: "M"},
+			init:   tokens{master: "M"},
+			raw:    tokens{masterSource: tokenStore.TokenSourceAPI},
 		},
 		{
-			name:   "clear repl",
+			name:   "clear master",
+			method: "PUT",
+			url:    "agent_master?token=root",
+			body:   body(""),
+			code:   http.StatusOK,
+			init:   tokens{master: "M"},
+			raw:    tokens{masterSource: tokenStore.TokenSourceAPI},
+		},
+		{
+			name:   "clear repl legacy",
 			method: "PUT",
 			url:    "acl_replication_token?token=root",
 			body:   body(""),
 			code:   http.StatusOK,
-			got:    tokens{repl: "R"},
+			init:   tokens{repl: "R"},
+			raw:    tokens{replSource: tokenStore.TokenSourceAPI},
+		},
+		{
+			name:   "clear repl",
+			method: "PUT",
+			url:    "replication?token=root",
+			body:   body(""),
+			code:   http.StatusOK,
+			init:   tokens{repl: "R"},
+			raw:    tokens{replSource: tokenStore.TokenSourceAPI},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resetTokens(tt.got)
+			resetTokens(tt.init)
 			url := fmt.Sprintf("/v1/agent/token/%s", tt.url)
 			resp := httptest.NewRecorder()
 			req, _ := http.NewRequest(tt.method, url, tt.body)
-			if _, err := a.srv.AgentToken(resp, req); err != nil {
-				t.Fatalf("err: %v", err)
-			}
-			if got, want := resp.Code, tt.code; got != want {
-				t.Fatalf("got %d want %d", got, want)
-			}
-			if got, want := a.tokens.UserToken(), tt.want.user; got != want {
-				t.Fatalf("got %q want %q", got, want)
-			}
-			if got, want := a.tokens.AgentToken(), tt.want.agent; got != want {
-				t.Fatalf("got %q want %q", got, want)
-			}
-			if tt.want.master != "" && !a.tokens.IsAgentMasterToken(tt.want.master) {
-				t.Fatalf("%q should be the master token", tt.want.master)
-			}
-			if got, want := a.tokens.ACLReplicationToken(), tt.want.repl; got != want {
-				t.Fatalf("got %q want %q", got, want)
-			}
+			_, err := a.srv.AgentToken(resp, req)
+			require.NoError(t, err)
+			require.Equal(t, tt.code, resp.Code)
+			require.Equal(t, tt.effective.user, a.tokens.UserToken())
+			require.Equal(t, tt.effective.agent, a.tokens.AgentToken())
+			require.Equal(t, tt.effective.master, a.tokens.AgentMasterToken())
+			require.Equal(t, tt.effective.repl, a.tokens.ReplicationToken())
+
+			tok, src := a.tokens.UserTokenAndSource()
+			require.Equal(t, tt.raw.user, tok)
+			require.Equal(t, tt.raw.userSource, src)
+
+			tok, src = a.tokens.AgentTokenAndSource()
+			require.Equal(t, tt.raw.agent, tok)
+			require.Equal(t, tt.raw.agentSource, src)
+
+			tok, src = a.tokens.AgentMasterTokenAndSource()
+			require.Equal(t, tt.raw.master, tok)
+			require.Equal(t, tt.raw.masterSource, src)
+
+			tok, src = a.tokens.ReplicationTokenAndSource()
+			require.Equal(t, tt.raw.repl, tok)
+			require.Equal(t, tt.raw.replSource, src)
 		})
 	}
 
@@ -4186,12 +4124,9 @@ func TestAgent_Token(t *testing.T) {
 	t.Run("permission denied", func(t *testing.T) {
 		resetTokens(tokens{})
 		req, _ := http.NewRequest("PUT", "/v1/agent/token/acl_token", body("X"))
-		if _, err := a.srv.AgentToken(nil, req); !acl.IsErrPermissionDenied(err) {
-			t.Fatalf("err: %v", err)
-		}
-		if got, want := a.tokens.UserToken(), ""; got != want {
-			t.Fatalf("got %q want %q", got, want)
-		}
+		_, err := a.srv.AgentToken(nil, req)
+		require.True(t, acl.IsErrPermissionDenied(err))
+		require.Equal(t, "", a.tokens.UserToken())
 	})
 }
 
@@ -4199,7 +4134,7 @@ func TestAgentConnectCARoots_empty(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "connect { enabled = false }")
+	a := NewTestAgent(t, t.Name(), "connect { enabled = false }")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -4215,7 +4150,7 @@ func TestAgentConnectCARoots_list(t *testing.T) {
 
 	assert := assert.New(t)
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -4292,7 +4227,7 @@ func TestAgentConnectCALeafCert_aclDefaultDeny(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), TestACLConfig()+testAllowProxyConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -4306,9 +4241,7 @@ func TestAgentConnectCALeafCert_aclDefaultDeny(t *testing.T) {
 			Check: structs.CheckType{
 				TTL: 15 * time.Second,
 			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
+			Connect: &structs.ServiceConnect{},
 		}
 
 		req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(reg))
@@ -4325,122 +4258,11 @@ func TestAgentConnectCALeafCert_aclDefaultDeny(t *testing.T) {
 	require.True(acl.IsErrPermissionDenied(err))
 }
 
-func TestAgentConnectCALeafCert_aclProxyToken(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	a := NewTestAgent(t.Name(), TestACLConfig()+testAllowProxyConfig())
-	defer a.Shutdown()
-	testrpc.WaitForLeader(t, a.RPC, "dc1")
-
-	// Register a service with a managed proxy
-	{
-		reg := &structs.ServiceDefinition{
-			ID:      "test-id",
-			Name:    "test",
-			Address: "127.0.0.1",
-			Port:    8000,
-			Check: structs.CheckType{
-				TTL: 15 * time.Second,
-			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
-		}
-
-		req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(reg))
-		resp := httptest.NewRecorder()
-		_, err := a.srv.AgentRegisterService(resp, req)
-		require.NoError(err)
-		require.Equal(200, resp.Code, "body: %s", resp.Body.String())
-	}
-
-	// Get the proxy token from the agent directly, since there is no API.
-	proxy := a.State.Proxy("test-id-proxy")
-	require.NotNil(proxy)
-	token := proxy.ProxyToken
-	require.NotEmpty(token)
-
-	req, _ := http.NewRequest("GET", "/v1/agent/connect/ca/leaf/test?token="+token, nil)
-	resp := httptest.NewRecorder()
-	obj, err := a.srv.AgentConnectCALeafCert(resp, req)
-	require.NoError(err)
-
-	// Get the issued cert
-	_, ok := obj.(*structs.IssuedCert)
-	require.True(ok)
-}
-
-func TestAgentConnectCALeafCert_aclProxyTokenOther(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	a := NewTestAgent(t.Name(), TestACLConfig()+testAllowProxyConfig())
-	defer a.Shutdown()
-	testrpc.WaitForLeader(t, a.RPC, "dc1")
-
-	// Register a service with a managed proxy
-	{
-		reg := &structs.ServiceDefinition{
-			ID:      "test-id",
-			Name:    "test",
-			Address: "127.0.0.1",
-			Port:    8000,
-			Check: structs.CheckType{
-				TTL: 15 * time.Second,
-			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
-		}
-
-		req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(reg))
-		resp := httptest.NewRecorder()
-		_, err := a.srv.AgentRegisterService(resp, req)
-		require.NoError(err)
-		require.Equal(200, resp.Code, "body: %s", resp.Body.String())
-	}
-
-	// Register another service
-	{
-		reg := &structs.ServiceDefinition{
-			ID:      "wrong-id",
-			Name:    "wrong",
-			Address: "127.0.0.1",
-			Port:    8000,
-			Check: structs.CheckType{
-				TTL: 15 * time.Second,
-			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
-		}
-
-		req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(reg))
-		resp := httptest.NewRecorder()
-		_, err := a.srv.AgentRegisterService(resp, req)
-		require.NoError(err)
-		require.Equal(200, resp.Code, "body: %s", resp.Body.String())
-	}
-
-	// Get the proxy token from the agent directly, since there is no API.
-	proxy := a.State.Proxy("wrong-id-proxy")
-	require.NotNil(proxy)
-	token := proxy.ProxyToken
-	require.NotEmpty(token)
-
-	req, _ := http.NewRequest("GET", "/v1/agent/connect/ca/leaf/test?token="+token, nil)
-	resp := httptest.NewRecorder()
-	_, err := a.srv.AgentConnectCALeafCert(resp, req)
-	require.Error(err)
-	require.True(acl.IsErrPermissionDenied(err))
-}
-
 func TestAgentConnectCALeafCert_aclServiceWrite(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), TestACLConfig()+testAllowProxyConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -4454,9 +4276,7 @@ func TestAgentConnectCALeafCert_aclServiceWrite(t *testing.T) {
 			Check: structs.CheckType{
 				TTL: 15 * time.Second,
 			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
+			Connect: &structs.ServiceConnect{},
 		}
 
 		req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(reg))
@@ -4498,7 +4318,7 @@ func TestAgentConnectCALeafCert_aclServiceReadDeny(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), TestACLConfig()+testAllowProxyConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -4512,9 +4332,7 @@ func TestAgentConnectCALeafCert_aclServiceReadDeny(t *testing.T) {
 			Check: structs.CheckType{
 				TTL: 15 * time.Second,
 			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
+			Connect: &structs.ServiceConnect{},
 		}
 
 		req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(reg))
@@ -4554,7 +4372,7 @@ func TestAgentConnectCALeafCert_good(t *testing.T) {
 
 	assert := assert.New(t)
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -4630,7 +4448,7 @@ func TestAgentConnectCALeafCert_good(t *testing.T) {
 				r.Fatalf("leaf has not updated")
 			}
 
-			// Got a new leaf. Sanity check it's a whole new key as well as differnt
+			// Got a new leaf. Sanity check it's a whole new key as well as different
 			// cert.
 			if issued.PrivateKeyPEM == issued2.PrivateKeyPEM {
 				r.Fatalf("new leaf has same private key as before")
@@ -4656,7 +4474,7 @@ func TestAgentConnectCALeafCert_goodNotLocal(t *testing.T) {
 
 	assert := assert.New(t)
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -4715,6 +4533,25 @@ func TestAgentConnectCALeafCert_goodNotLocal(t *testing.T) {
 		require.Equal("HIT", resp.Header().Get("X-Cache"))
 	}
 
+	// Test Blocking - see https://github.com/hashicorp/consul/issues/4462
+	{
+		// Fetch it again
+		resp := httptest.NewRecorder()
+		blockingReq, _ := http.NewRequest("GET", fmt.Sprintf("/v1/agent/connect/ca/leaf/test?wait=125ms&index=%d", issued.ModifyIndex), nil)
+		doneCh := make(chan struct{})
+		go func() {
+			a.srv.AgentConnectCALeafCert(resp, blockingReq)
+			close(doneCh)
+		}()
+
+		select {
+		case <-time.After(500 * time.Millisecond):
+			require.FailNow("Shouldn't block for this long - not respecting wait parameter in the query")
+
+		case <-doneCh:
+		}
+	}
+
 	// Test that caching is updated in the background
 	{
 		// Set a new CA
@@ -4768,761 +4605,10 @@ func requireLeafValidUnderCA(t *testing.T, issued *structs.IssuedCert,
 	require.NoError(t, err)
 }
 
-func TestAgentConnectProxyConfig_Blocking(t *testing.T) {
-	t.Parallel()
-
-	a := NewTestAgent(t.Name(), testAllowProxyConfig())
-	defer a.Shutdown()
-	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
-
-	// Define a local service with a managed proxy. It's registered in the test
-	// loop to make sure agent state is predictable whatever order tests execute
-	// since some alter this service config.
-	reg := &structs.ServiceDefinition{
-		Name:    "test",
-		Address: "127.0.0.1",
-		Port:    8000,
-		Check: structs.CheckType{
-			TTL: 15 * time.Second,
-		},
-		Connect: &structs.ServiceConnect{
-			Proxy: &structs.ServiceDefinitionConnectProxy{
-				Command: []string{"tubes.sh"},
-				Config: map[string]interface{}{
-					"bind_port":          1234,
-					"connect_timeout_ms": 500,
-					// Specify upstreams in deprecated nested config way here. We test the
-					// new way in the update case below.
-					"upstreams": []map[string]interface{}{
-						{
-							"destination_name": "db",
-							"local_bind_port":  3131,
-						},
-					},
-				},
-			},
-		},
-	}
-
-	expectedResponse := &api.ConnectProxyConfig{
-		ProxyServiceID:    "test-proxy",
-		TargetServiceID:   "test",
-		TargetServiceName: "test",
-		ContentHash:       "a7c93585b6d70445",
-		ExecMode:          "daemon",
-		Command:           []string{"tubes.sh"},
-		Config: map[string]interface{}{
-			"bind_address":          "127.0.0.1",
-			"local_service_address": "127.0.0.1:8000",
-			"bind_port":             int(1234),
-			"connect_timeout_ms":    float64(500),
-		},
-		Upstreams: []api.Upstream{
-			{
-				DestinationType: "service",
-				DestinationName: "db",
-				LocalBindPort:   3131,
-			},
-		},
-	}
-
-	ur, err := copystructure.Copy(expectedResponse)
-	require.NoError(t, err)
-	updatedResponse := ur.(*api.ConnectProxyConfig)
-	updatedResponse.ContentHash = "aedc0ca0f3f7794e"
-	updatedResponse.Upstreams = append(updatedResponse.Upstreams, api.Upstream{
-		DestinationType: "service",
-		DestinationName: "cache",
-		LocalBindPort:   4242,
-		Config: map[string]interface{}{
-			"connect_timeout_ms": float64(1000),
-		},
-	})
-
-	tests := []struct {
-		name       string
-		url        string
-		updateFunc func()
-		wantWait   time.Duration
-		wantCode   int
-		wantErr    bool
-		wantResp   *api.ConnectProxyConfig
-	}{
-		{
-			name:     "simple fetch",
-			url:      "/v1/agent/connect/proxy/test-proxy",
-			wantCode: 200,
-			wantErr:  false,
-			wantResp: expectedResponse,
-		},
-		{
-			name:     "blocking fetch timeout, no change",
-			url:      "/v1/agent/connect/proxy/test-proxy?hash=" + expectedResponse.ContentHash + "&wait=100ms",
-			wantWait: 100 * time.Millisecond,
-			wantCode: 200,
-			wantErr:  false,
-			wantResp: expectedResponse,
-		},
-		{
-			name:     "blocking fetch old hash should return immediately",
-			url:      "/v1/agent/connect/proxy/test-proxy?hash=123456789abcd&wait=10m",
-			wantCode: 200,
-			wantErr:  false,
-			wantResp: expectedResponse,
-		},
-		{
-			name: "blocking fetch returns change",
-			url:  "/v1/agent/connect/proxy/test-proxy?hash=" + expectedResponse.ContentHash,
-			updateFunc: func() {
-				time.Sleep(100 * time.Millisecond)
-				// Re-register with new proxy config
-				r2, err := copystructure.Copy(reg)
-				require.NoError(t, err)
-				reg2 := r2.(*structs.ServiceDefinition)
-				reg2.Connect.Proxy.Upstreams = structs.UpstreamsFromAPI(updatedResponse.Upstreams)
-				req, _ := http.NewRequest("PUT", "/v1/agent/service/register", jsonReader(r2))
-				resp := httptest.NewRecorder()
-				_, err = a.srv.AgentRegisterService(resp, req)
-				require.NoError(t, err)
-				require.Equal(t, 200, resp.Code, "body: %s", resp.Body.String())
-			},
-			wantWait: 100 * time.Millisecond,
-			wantCode: 200,
-			wantErr:  false,
-			wantResp: updatedResponse,
-		},
-		{
-			// This test exercises a case that caused a busy loop to eat CPU for the
-			// entire duration of the blocking query. If a service gets re-registered
-			// wth same proxy config then the old proxy config chan is closed causing
-			// blocked watchset.Watch to return false indicating a change. But since
-			// the hash is the same when the blocking fn is re-called we should just
-			// keep blocking on the next iteration. The bug hit was that the WatchSet
-			// ws was not being reset in the loop and so when you try to `Watch` it
-			// the second time it just returns immediately making the blocking loop
-			// into a busy-poll!
-			//
-			// This test though doesn't catch that because busy poll still has the
-			// correct external behaviour. I don't want to instrument the loop to
-			// assert it's not executing too fast here as I can't think of a clean way
-			// and the issue is fixed now so this test doesn't actually catch the
-			// error, but does provide an easy way to verify the behaviour by hand:
-			//  1. Make this test fail e.g. change wantErr to true
-			//  2. Add a log.Println or similar into the blocking loop/function
-			//  3. See whether it's called just once or many times in a tight loop.
-			name: "blocking fetch interrupted with no change (same hash)",
-			url:  "/v1/agent/connect/proxy/test-proxy?wait=200ms&hash=" + expectedResponse.ContentHash,
-			updateFunc: func() {
-				time.Sleep(100 * time.Millisecond)
-				// Re-register with _same_ proxy config
-				req, _ := http.NewRequest("PUT", "/v1/agent/service/register", jsonReader(reg))
-				resp := httptest.NewRecorder()
-				_, err = a.srv.AgentRegisterService(resp, req)
-				require.NoError(t, err)
-				require.Equal(t, 200, resp.Code, "body: %s", resp.Body.String())
-			},
-			wantWait: 200 * time.Millisecond,
-			wantCode: 200,
-			wantErr:  false,
-			wantResp: expectedResponse,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert := assert.New(t)
-			require := require.New(t)
-
-			// Register the basic service to ensure it's in a known state to start.
-			{
-				req, _ := http.NewRequest("PUT", "/v1/agent/service/register", jsonReader(reg))
-				resp := httptest.NewRecorder()
-				_, err := a.srv.AgentRegisterService(resp, req)
-				require.NoError(err)
-				require.Equal(200, resp.Code, "body: %s", resp.Body.String())
-			}
-
-			req, _ := http.NewRequest("GET", tt.url, nil)
-			resp := httptest.NewRecorder()
-			if tt.updateFunc != nil {
-				go tt.updateFunc()
-			}
-			start := time.Now()
-			obj, err := a.srv.AgentConnectProxyConfig(resp, req)
-			elapsed := time.Now().Sub(start)
-
-			if tt.wantErr {
-				require.Error(err)
-			} else {
-				require.NoError(err)
-			}
-			if tt.wantCode != 0 {
-				require.Equal(tt.wantCode, resp.Code, "body: %s", resp.Body.String())
-			}
-			if tt.wantWait != 0 {
-				assert.True(elapsed >= tt.wantWait, "should have waited at least %s, "+
-					"took %s", tt.wantWait, elapsed)
-			} else {
-				assert.True(elapsed < 10*time.Millisecond, "should not have waited, "+
-					"took %s", elapsed)
-			}
-
-			assert.Equal(tt.wantResp, obj)
-
-			assert.Equal(tt.wantResp.ContentHash, resp.Header().Get("X-Consul-ContentHash"))
-		})
-	}
-}
-
-func TestAgentConnectProxyConfig_aclDefaultDeny(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	a := NewTestAgent(t.Name(), TestACLConfig()+testAllowProxyConfig())
-	defer a.Shutdown()
-	testrpc.WaitForLeader(t, a.RPC, "dc1")
-
-	// Register a service with a managed proxy
-	{
-		reg := &structs.ServiceDefinition{
-			ID:      "test-id",
-			Name:    "test",
-			Address: "127.0.0.1",
-			Port:    8000,
-			Check: structs.CheckType{
-				TTL: 15 * time.Second,
-			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
-		}
-
-		req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(reg))
-		resp := httptest.NewRecorder()
-		_, err := a.srv.AgentRegisterService(resp, req)
-		require.NoError(err)
-		require.Equal(200, resp.Code, "body: %s", resp.Body.String())
-	}
-
-	req, _ := http.NewRequest("GET", "/v1/agent/connect/proxy/test-id-proxy", nil)
-	resp := httptest.NewRecorder()
-	_, err := a.srv.AgentConnectProxyConfig(resp, req)
-	require.True(acl.IsErrPermissionDenied(err))
-}
-
-func TestAgentConnectProxyConfig_aclProxyToken(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	a := NewTestAgent(t.Name(), TestACLConfig()+testAllowProxyConfig())
-	defer a.Shutdown()
-	testrpc.WaitForLeader(t, a.RPC, "dc1")
-
-	// Register a service with a managed proxy
-	{
-		reg := &structs.ServiceDefinition{
-			ID:      "test-id",
-			Name:    "test",
-			Address: "127.0.0.1",
-			Port:    8000,
-			Check: structs.CheckType{
-				TTL: 15 * time.Second,
-			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
-		}
-
-		req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(reg))
-		resp := httptest.NewRecorder()
-		_, err := a.srv.AgentRegisterService(resp, req)
-		require.NoError(err)
-		require.Equal(200, resp.Code, "body: %s", resp.Body.String())
-	}
-
-	// Get the proxy token from the agent directly, since there is no API
-	// to expose this.
-	proxy := a.State.Proxy("test-id-proxy")
-	require.NotNil(proxy)
-	token := proxy.ProxyToken
-	require.NotEmpty(token)
-
-	req, _ := http.NewRequest(
-		"GET", "/v1/agent/connect/proxy/test-id-proxy?token="+token, nil)
-	resp := httptest.NewRecorder()
-	obj, err := a.srv.AgentConnectProxyConfig(resp, req)
-	require.NoError(err)
-	proxyCfg := obj.(*api.ConnectProxyConfig)
-	require.Equal("test-id-proxy", proxyCfg.ProxyServiceID)
-	require.Equal("test-id", proxyCfg.TargetServiceID)
-	require.Equal("test", proxyCfg.TargetServiceName)
-}
-
-func TestAgentConnectProxyConfig_aclServiceWrite(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	a := NewTestAgent(t.Name(), TestACLConfig()+testAllowProxyConfig())
-	defer a.Shutdown()
-	testrpc.WaitForLeader(t, a.RPC, "dc1")
-
-	// Register a service with a managed proxy
-	{
-		reg := &structs.ServiceDefinition{
-			ID:      "test-id",
-			Name:    "test",
-			Address: "127.0.0.1",
-			Port:    8000,
-			Check: structs.CheckType{
-				TTL: 15 * time.Second,
-			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
-		}
-
-		req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(reg))
-		resp := httptest.NewRecorder()
-		_, err := a.srv.AgentRegisterService(resp, req)
-		require.NoError(err)
-		require.Equal(200, resp.Code, "body: %s", resp.Body.String())
-	}
-
-	// Create an ACL with service:write for our service
-	var token string
-	{
-		args := map[string]interface{}{
-			"Name":  "User Token",
-			"Type":  "client",
-			"Rules": `service "test" { policy = "write" }`,
-		}
-		req, _ := http.NewRequest("PUT", "/v1/acl/create?token=root", jsonReader(args))
-		resp := httptest.NewRecorder()
-		obj, err := a.srv.ACLCreate(resp, req)
-		if err != nil {
-			t.Fatalf("err: %v", err)
-		}
-		aclResp := obj.(aclCreateResponse)
-		token = aclResp.ID
-	}
-
-	req, _ := http.NewRequest(
-		"GET", "/v1/agent/connect/proxy/test-id-proxy?token="+token, nil)
-	resp := httptest.NewRecorder()
-	obj, err := a.srv.AgentConnectProxyConfig(resp, req)
-	require.NoError(err)
-	proxyCfg := obj.(*api.ConnectProxyConfig)
-	require.Equal("test-id-proxy", proxyCfg.ProxyServiceID)
-	require.Equal("test-id", proxyCfg.TargetServiceID)
-	require.Equal("test", proxyCfg.TargetServiceName)
-}
-
-func TestAgentConnectProxyConfig_aclServiceReadDeny(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	a := NewTestAgent(t.Name(), TestACLConfig()+testAllowProxyConfig())
-	defer a.Shutdown()
-
-	testrpc.WaitForLeader(t, a.RPC, "dc1")
-	// Register a service with a managed proxy
-	{
-		reg := &structs.ServiceDefinition{
-			ID:      "test-id",
-			Name:    "test",
-			Address: "127.0.0.1",
-			Port:    8000,
-			Check: structs.CheckType{
-				TTL: 15 * time.Second,
-			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
-		}
-
-		req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(reg))
-		resp := httptest.NewRecorder()
-		_, err := a.srv.AgentRegisterService(resp, req)
-		require.NoError(err)
-		require.Equal(200, resp.Code, "body: %s", resp.Body.String())
-	}
-
-	// Create an ACL with service:read for our service
-	var token string
-	{
-		args := map[string]interface{}{
-			"Name":  "User Token",
-			"Type":  "client",
-			"Rules": `service "test" { policy = "read" }`,
-		}
-		req, _ := http.NewRequest("PUT", "/v1/acl/create?token=root", jsonReader(args))
-		resp := httptest.NewRecorder()
-		obj, err := a.srv.ACLCreate(resp, req)
-		if err != nil {
-			t.Fatalf("err: %v", err)
-		}
-		aclResp := obj.(aclCreateResponse)
-		token = aclResp.ID
-	}
-
-	req, _ := http.NewRequest(
-		"GET", "/v1/agent/connect/proxy/test-id-proxy?token="+token, nil)
-	resp := httptest.NewRecorder()
-	_, err := a.srv.AgentConnectProxyConfig(resp, req)
-	require.True(acl.IsErrPermissionDenied(err))
-}
-
 func makeTelemetryDefaults(targetID string) lib.TelemetryConfig {
 	return lib.TelemetryConfig{
 		FilterDefault: true,
 		MetricsPrefix: "consul.proxy." + targetID,
-	}
-}
-
-func TestAgentConnectProxyConfig_ConfigHandling(t *testing.T) {
-	t.Parallel()
-
-	// Get the default command to compare below
-	defaultCommand, err := defaultProxyCommand(nil)
-	require.NoError(t, err)
-
-	// Define a local service with a managed proxy. It's registered in the test
-	// loop to make sure agent state is predictable whatever order tests execute
-	// since some alter this service config.
-	reg := &structs.ServiceDefinition{
-		ID:      "test-id",
-		Name:    "test",
-		Address: "127.0.0.1",
-		Port:    8000,
-		Check: structs.CheckType{
-			TTL: 15 * time.Second,
-		},
-		Connect: &structs.ServiceConnect{
-			// Proxy is populated with the definition in the table below.
-		},
-	}
-
-	tests := []struct {
-		name         string
-		globalConfig string
-		proxy        structs.ServiceDefinitionConnectProxy
-		useToken     string
-		wantMode     api.ProxyExecMode
-		wantCommand  []string
-		wantConfig   map[string]interface{}
-	}{
-		{
-			name: "defaults",
-			globalConfig: `
-			bind_addr = "0.0.0.0"
-			connect {
-				enabled = true
-				proxy {
-					allow_managed_api_registration = true
-				}
-			}
-			ports {
-				proxy_min_port = 10000
-				proxy_max_port = 10000
-			}
-			`,
-			proxy:       structs.ServiceDefinitionConnectProxy{},
-			wantMode:    api.ProxyExecModeDaemon,
-			wantCommand: defaultCommand,
-			wantConfig: map[string]interface{}{
-				"bind_address":          "0.0.0.0",
-				"bind_port":             10000,            // "randomly" chosen from our range of 1
-				"local_service_address": "127.0.0.1:8000", // port from service reg
-				"telemetry":             makeTelemetryDefaults(reg.ID),
-			},
-		},
-		{
-			name: "global defaults - script",
-			globalConfig: `
-			bind_addr = "0.0.0.0"
-			connect {
-				enabled = true
-				proxy {
-					allow_managed_api_registration = true
-				}
-				proxy_defaults = {
-					exec_mode = "script"
-					script_command = ["script.sh"]
-				}
-			}
-			ports {
-				proxy_min_port = 10000
-				proxy_max_port = 10000
-			}
-			`,
-			proxy:       structs.ServiceDefinitionConnectProxy{},
-			wantMode:    api.ProxyExecModeScript,
-			wantCommand: []string{"script.sh"},
-			wantConfig: map[string]interface{}{
-				"bind_address":          "0.0.0.0",
-				"bind_port":             10000,            // "randomly" chosen from our range of 1
-				"local_service_address": "127.0.0.1:8000", // port from service reg
-				"telemetry":             makeTelemetryDefaults(reg.ID),
-			},
-		},
-		{
-			name: "global defaults - daemon",
-			globalConfig: `
-			bind_addr = "0.0.0.0"
-			connect {
-				enabled = true
-				proxy {
-					allow_managed_api_registration = true
-				}
-				proxy_defaults = {
-					exec_mode = "daemon"
-					daemon_command = ["daemon.sh"]
-				}
-			}
-			ports {
-				proxy_min_port = 10000
-				proxy_max_port = 10000
-			}
-			`,
-			proxy:       structs.ServiceDefinitionConnectProxy{},
-			wantMode:    api.ProxyExecModeDaemon,
-			wantCommand: []string{"daemon.sh"},
-			wantConfig: map[string]interface{}{
-				"bind_address":          "0.0.0.0",
-				"bind_port":             10000,            // "randomly" chosen from our range of 1
-				"local_service_address": "127.0.0.1:8000", // port from service reg
-				"telemetry":             makeTelemetryDefaults(reg.ID),
-			},
-		},
-		{
-			name: "global default config merge",
-			globalConfig: `
-			bind_addr = "0.0.0.0"
-			connect {
-				enabled = true
-				proxy {
-					allow_managed_api_registration = true
-				}
-				proxy_defaults = {
-					config = {
-						connect_timeout_ms = 1000
-					}
-				}
-			}
-			ports {
-				proxy_min_port = 10000
-				proxy_max_port = 10000
-			}
-			telemetry {
-				statsite_address = "localhost:8989"
-			}
-			`,
-			proxy: structs.ServiceDefinitionConnectProxy{
-				Config: map[string]interface{}{
-					"foo": "bar",
-				},
-			},
-			wantMode:    api.ProxyExecModeDaemon,
-			wantCommand: defaultCommand,
-			wantConfig: map[string]interface{}{
-				"bind_address":          "0.0.0.0",
-				"bind_port":             10000,            // "randomly" chosen from our range of 1
-				"local_service_address": "127.0.0.1:8000", // port from service reg
-				"connect_timeout_ms":    1000,
-				"foo":                   "bar",
-				"telemetry": lib.TelemetryConfig{
-					FilterDefault: true,
-					MetricsPrefix: "consul.proxy." + reg.ID,
-					StatsiteAddr:  "localhost:8989",
-				},
-			},
-		},
-		{
-			name: "overrides in reg",
-			globalConfig: `
-			bind_addr = "0.0.0.0"
-			connect {
-				enabled = true
-				proxy {
-					allow_managed_api_registration = true
-				}
-				proxy_defaults = {
-					exec_mode = "daemon"
-					daemon_command = ["daemon.sh"]
-					script_command = ["script.sh"]
-					config = {
-						connect_timeout_ms = 1000
-					}
-				}
-			}
-			ports {
-				proxy_min_port = 10000
-				proxy_max_port = 10000
-			}
-			telemetry {
-				statsite_address = "localhost:8989"
-			}
-			`,
-			proxy: structs.ServiceDefinitionConnectProxy{
-				ExecMode: "script",
-				Command:  []string{"foo.sh"},
-				Config: map[string]interface{}{
-					"connect_timeout_ms":    2000,
-					"bind_address":          "127.0.0.1",
-					"bind_port":             1024,
-					"local_service_address": "127.0.0.1:9191",
-					"telemetry": map[string]interface{}{
-						"statsite_address": "stats.it:10101",
-						"metrics_prefix":   "foo", // important! checks that our prefix logic respects user customization
-					},
-				},
-			},
-			wantMode:    api.ProxyExecModeScript,
-			wantCommand: []string{"foo.sh"},
-			wantConfig: map[string]interface{}{
-				"bind_address":          "127.0.0.1",
-				"bind_port":             int(1024),
-				"local_service_address": "127.0.0.1:9191",
-				"connect_timeout_ms":    float64(2000),
-				"telemetry": lib.TelemetryConfig{
-					FilterDefault: true,
-					MetricsPrefix: "foo",
-					StatsiteAddr:  "stats.it:10101",
-				},
-			},
-		},
-		{
-			name: "reg telemetry not compatible, preserved with no merge",
-			globalConfig: `
-			connect {
-				enabled = true
-				proxy {
-					allow_managed_api_registration = true
-				}
-			}
-			ports {
-				proxy_min_port = 10000
-				proxy_max_port = 10000
-			}
-			telemetry {
-				statsite_address = "localhost:8989"
-			}
-			`,
-			proxy: structs.ServiceDefinitionConnectProxy{
-				ExecMode: "script",
-				Command:  []string{"foo.sh"},
-				Config: map[string]interface{}{
-					"telemetry": map[string]interface{}{
-						"foo": "bar",
-					},
-				},
-			},
-			wantMode:    api.ProxyExecModeScript,
-			wantCommand: []string{"foo.sh"},
-			wantConfig: map[string]interface{}{
-				"bind_address":          "127.0.0.1",
-				"bind_port":             10000,            // "randomly" chosen from our range of 1
-				"local_service_address": "127.0.0.1:8000", // port from service reg
-				"telemetry": map[string]interface{}{
-					"foo": "bar",
-				},
-			},
-		},
-		{
-			name:     "reg passed through with no agent config added if not proxy token auth",
-			useToken: "foo", // no actual ACLs set so this any token will work but has to be non-empty to be used below
-			globalConfig: `
-			bind_addr = "0.0.0.0"
-			connect {
-				enabled = true
-				proxy {
-					allow_managed_api_registration = true
-				}
-				proxy_defaults = {
-					exec_mode = "daemon"
-					daemon_command = ["daemon.sh"]
-					script_command = ["script.sh"]
-					config = {
-						connect_timeout_ms = 1000
-					}
-				}
-			}
-			ports {
-				proxy_min_port = 10000
-				proxy_max_port = 10000
-			}
-			telemetry {
-				statsite_address = "localhost:8989"
-			}
-			`,
-			proxy: structs.ServiceDefinitionConnectProxy{
-				ExecMode: "script",
-				Command:  []string{"foo.sh"},
-				Config: map[string]interface{}{
-					"connect_timeout_ms":    2000,
-					"bind_address":          "127.0.0.1",
-					"bind_port":             1024,
-					"local_service_address": "127.0.0.1:9191",
-					"telemetry": map[string]interface{}{
-						"metrics_prefix": "foo",
-					},
-				},
-			},
-			wantMode:    api.ProxyExecModeScript,
-			wantCommand: []string{"foo.sh"},
-			wantConfig: map[string]interface{}{
-				"bind_address":          "127.0.0.1",
-				"bind_port":             int(1024),
-				"local_service_address": "127.0.0.1:9191",
-				"connect_timeout_ms":    float64(2000),
-				"telemetry": map[string]interface{}{ // No defaults merged
-					"metrics_prefix": "foo",
-				},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert := assert.New(t)
-			require := require.New(t)
-
-			a := NewTestAgent(t.Name(), tt.globalConfig)
-			defer a.Shutdown()
-			testrpc.WaitForTestAgent(t, a.RPC, "dc1")
-
-			// Register the basic service with the required config
-			{
-				reg.Connect.Proxy = &tt.proxy
-				req, _ := http.NewRequest("PUT", "/v1/agent/service/register", jsonReader(reg))
-				resp := httptest.NewRecorder()
-				_, err := a.srv.AgentRegisterService(resp, req)
-				require.NoError(err)
-				require.Equal(200, resp.Code, "body: %s", resp.Body.String())
-			}
-
-			proxy := a.State.Proxy("test-id-proxy")
-			require.NotNil(proxy)
-			require.NotEmpty(proxy.ProxyToken)
-
-			req, _ := http.NewRequest("GET", "/v1/agent/connect/proxy/test-id-proxy", nil)
-			if tt.useToken != "" {
-				req.Header.Set("X-Consul-Token", tt.useToken)
-			} else {
-				req.Header.Set("X-Consul-Token", proxy.ProxyToken)
-			}
-			resp := httptest.NewRecorder()
-			obj, err := a.srv.AgentConnectProxyConfig(resp, req)
-			require.NoError(err)
-
-			proxyCfg := obj.(*api.ConnectProxyConfig)
-			assert.Equal("test-id-proxy", proxyCfg.ProxyServiceID)
-			assert.Equal("test-id", proxyCfg.TargetServiceID)
-			assert.Equal("test", proxyCfg.TargetServiceName)
-			assert.Equal(tt.wantMode, proxyCfg.ExecMode)
-			assert.Equal(tt.wantCommand, proxyCfg.Command)
-			require.Equal(tt.wantConfig, proxyCfg.Config)
-		})
 	}
 }
 
@@ -5531,7 +4617,7 @@ func TestAgentConnectAuthorize_badBody(t *testing.T) {
 
 	assert := assert.New(t)
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
@@ -5551,7 +4637,7 @@ func TestAgentConnectAuthorize_noTarget(t *testing.T) {
 
 	assert := assert.New(t)
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
@@ -5572,7 +4658,7 @@ func TestAgentConnectAuthorize_idInvalidFormat(t *testing.T) {
 
 	assert := assert.New(t)
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
@@ -5596,7 +4682,7 @@ func TestAgentConnectAuthorize_idNotService(t *testing.T) {
 
 	assert := assert.New(t)
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
@@ -5619,7 +4705,7 @@ func TestAgentConnectAuthorize_allow(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
@@ -5716,7 +4802,7 @@ func TestAgentConnectAuthorize_deny(t *testing.T) {
 	t.Parallel()
 
 	assert := assert.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
@@ -5766,7 +4852,7 @@ func TestAgentConnectAuthorize_allowTrustDomain(t *testing.T) {
 
 	assert := assert.New(t)
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
@@ -5811,7 +4897,7 @@ func TestAgentConnectAuthorize_denyWildcard(t *testing.T) {
 
 	assert := assert.New(t)
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
@@ -5891,7 +4977,7 @@ func TestAgentConnectAuthorize_serviceWrite(t *testing.T) {
 	t.Parallel()
 
 	assert := assert.New(t)
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -5929,7 +5015,7 @@ func TestAgentConnectAuthorize_defaultDeny(t *testing.T) {
 	t.Parallel()
 
 	assert := assert.New(t)
-	a := NewTestAgent(t.Name(), TestACLConfig())
+	a := NewTestAgent(t, t.Name(), TestACLConfig())
 	defer a.Shutdown()
 	testrpc.WaitForLeader(t, a.RPC, "dc1")
 
@@ -5954,7 +5040,7 @@ func TestAgentConnectAuthorize_defaultAllow(t *testing.T) {
 
 	assert := assert.New(t)
 	dc1 := "dc1"
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 		acl_datacenter = "`+dc1+`"
 		acl_default_policy = "allow"
 		acl_master_token = "root"
@@ -5981,26 +5067,12 @@ func TestAgentConnectAuthorize_defaultAllow(t *testing.T) {
 	assert.Contains(obj.Reason, "Default behavior")
 }
 
-// testAllowProxyConfig returns agent config to allow managed proxy API
-// registration.
-func testAllowProxyConfig() string {
-	return `
-		connect {
-			enabled = true
-
-			proxy {
-				allow_managed_api_registration = true
-			}
-		}
-	`
-}
-
 func TestAgent_Host(t *testing.T) {
 	t.Parallel()
 	assert := assert.New(t)
 
 	dc1 := "dc1"
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 	acl_datacenter = "`+dc1+`"
 	acl_default_policy = "allow"
 	acl_master_token = "master"
@@ -6028,7 +5100,7 @@ func TestAgent_HostBadACL(t *testing.T) {
 	assert := assert.New(t)
 
 	dc1 := "dc1"
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 	acl_datacenter = "`+dc1+`"
 	acl_default_policy = "deny"
 	acl_master_token = "root"

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hashicorp/consul/testutil/retry"
+	"github.com/hashicorp/consul/sdk/testutil/retry"
 
 	"github.com/stretchr/testify/require"
 )
@@ -498,6 +498,7 @@ func TestAPI_ACLToken_List(t *testing.T) {
 	defer s.Stop()
 
 	acl := c.ACL()
+	s.WaitForSerfCheck(t)
 
 	policies := prepTokenPolicies(t, acl)
 
@@ -642,10 +643,10 @@ func TestAPI_RulesTranslate_FromToken(t *testing.T) {
 
 	// This relies on the token upgrade loop running in the background
 	// to assign an accessor
-	retry.Run(t, func(t *retry.R) {
+	retry.Run(t, func(r *retry.R) {
 		token, _, err := acl.TokenReadSelf(nil)
-		require.NoError(t, err)
-		require.NotEqual(t, "", token.AccessorID)
+		require.NoError(r, err)
+		require.NotEqual(r, "", token.AccessorID)
 		accessor = token.AccessorID
 	})
 	acl.c.config.Token = "root"

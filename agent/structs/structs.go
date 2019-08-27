@@ -2,8 +2,10 @@ package structs
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net"
 	"reflect"
 	"regexp"
 	"sort"
@@ -11,13 +13,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/go-msgpack/codec"
+	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/serf/coordinate"
+	"github.com/mitchellh/hashstructure"
+
 	"github.com/hashicorp/consul/agent/cache"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/types"
-	"github.com/hashicorp/go-msgpack/codec"
-	"github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/serf/coordinate"
-	"github.com/mitchellh/hashstructure"
 )
 
 type MessageType uint8
@@ -25,34 +28,43 @@ type MessageType uint8
 // RaftIndex is used to track the index used while creating
 // or modifying a given struct type.
 type RaftIndex struct {
-	CreateIndex uint64
-	ModifyIndex uint64
+	CreateIndex uint64 `bexpr:"-"`
+	ModifyIndex uint64 `bexpr:"-"`
 }
 
 // These are serialized between Consul servers and stored in Consul snapshots,
 // so entries must only ever be added.
 const (
-	RegisterRequestType        MessageType = 0
-	DeregisterRequestType                  = 1
-	KVSRequestType                         = 2
-	SessionRequestType                     = 3
-	ACLRequestType                         = 4 // DEPRECATED (ACL-Legacy-Compat)
-	TombstoneRequestType                   = 5
-	CoordinateBatchUpdateType              = 6
-	PreparedQueryRequestType               = 7
-	TxnRequestType                         = 8
-	AutopilotRequestType                   = 9
-	AreaRequestType                        = 10
-	ACLBootstrapRequestType                = 11
-	IntentionRequestType                   = 12
-	ConnectCARequestType                   = 13
-	ConnectCAProviderStateType             = 14
-	ConnectCAConfigType                    = 15 // FSM snapshots only.
-	IndexRequestType                       = 16 // FSM snapshots only.
-	ACLTokenSetRequestType                 = 17
-	ACLTokenDeleteRequestType              = 18
-	ACLPolicySetRequestType                = 19
-	ACLPolicyDeleteRequestType             = 20
+	RegisterRequestType             MessageType = 0
+	DeregisterRequestType                       = 1
+	KVSRequestType                              = 2
+	SessionRequestType                          = 3
+	ACLRequestType                              = 4 // DEPRECATED (ACL-Legacy-Compat)
+	TombstoneRequestType                        = 5
+	CoordinateBatchUpdateType                   = 6
+	PreparedQueryRequestType                    = 7
+	TxnRequestType                              = 8
+	AutopilotRequestType                        = 9
+	AreaRequestType                             = 10
+	ACLBootstrapRequestType                     = 11
+	IntentionRequestType                        = 12
+	ConnectCARequestType                        = 13
+	ConnectCAProviderStateType                  = 14
+	ConnectCAConfigType                         = 15 // FSM snapshots only.
+	IndexRequestType                            = 16 // FSM snapshots only.
+	ACLTokenSetRequestType                      = 17
+	ACLTokenDeleteRequestType                   = 18
+	ACLPolicySetRequestType                     = 19
+	ACLPolicyDeleteRequestType                  = 20
+	ConnectCALeafRequestType                    = 21
+	ConfigEntryRequestType                      = 22
+	ACLRoleSetRequestType                       = 23
+	ACLRoleDeleteRequestType                    = 24
+	ACLBindingRuleSetRequestType                = 25
+	ACLBindingRuleDeleteRequestType             = 26
+	ACLAuthMethodSetRequestType                 = 27
+	ACLAuthMethodDeleteRequestType              = 28
+	ChunkingStateType                           = 29
 )
 
 const (
@@ -143,7 +155,7 @@ type QueryOptions struct {
 	// If there is a cached response that is older than the MaxAge, it is treated
 	// as a cache miss and a new fetch invoked. If the fetch fails, the error is
 	// returned. Clients that wish to allow for stale results on error can set
-	// StaleIfError to a longer duration to change this behaviour. It is ignored
+	// StaleIfError to a longer duration to change this behavior. It is ignored
 	// if the endpoint supports background refresh caching. See
 	// https://www.consul.io/api/index.html#agent-caching for more details.
 	MaxAge time.Duration
@@ -161,6 +173,10 @@ type QueryOptions struct {
 	// ignored if the endpoint supports background refresh caching. See
 	// https://www.consul.io/api/index.html#agent-caching for more details.
 	StaleIfError time.Duration
+
+	// Filter specifies the go-bexpr filter expression to be used for
+	// filtering the data prior to returning a response
+	Filter string
 }
 
 // IsRead is always true for QueryOption.
@@ -307,6 +323,22 @@ type QuerySource struct {
 	Ip         string
 }
 
+type DatacentersRequest struct {
+	QueryOptions
+}
+
+func (r *DatacentersRequest) CacheInfo() cache.RequestInfo {
+	return cache.RequestInfo{
+		Token:          "",
+		Datacenter:     "",
+		MinIndex:       0,
+		Timeout:        r.MaxQueryTime,
+		MaxAge:         r.MaxAge,
+		MustRevalidate: r.MustRevalidate,
+		Key:            "catalog-datacenters", // must not be empty for cache to work
+	}
+}
+
 // DCSpecificRequest is used to query about a specific DC
 type DCSpecificRequest struct {
 	Datacenter      string
@@ -329,10 +361,13 @@ func (r *DCSpecificRequest) CacheInfo() cache.RequestInfo {
 		MustRevalidate: r.MustRevalidate,
 	}
 
-	// To calculate the cache key we only hash the node filters. The
-	// datacenter is handled by the cache framework. The other fields are
+	// To calculate the cache key we only hash the node meta filters and the bexpr filter.
+	// The datacenter is handled by the cache framework. The other fields are
 	// not, but should not be used in any cache types.
-	v, err := hashstructure.Hash(r.NodeMetaFilters, nil)
+	v, err := hashstructure.Hash([]interface{}{
+		r.NodeMetaFilters,
+		r.Filter,
+	}, nil)
 	if err == nil {
 		// If there is an error, we don't set the key. A blank key forces
 		// no cache for this request so the request is forwarded directly
@@ -344,6 +379,55 @@ func (r *DCSpecificRequest) CacheInfo() cache.RequestInfo {
 }
 
 func (r *DCSpecificRequest) CacheMinIndex() uint64 {
+	return r.QueryOptions.MinQueryIndex
+}
+
+type ServiceDumpRequest struct {
+	Datacenter     string
+	ServiceKind    ServiceKind
+	UseServiceKind bool
+	Source         QuerySource
+	QueryOptions
+}
+
+func (r *ServiceDumpRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+func (r *ServiceDumpRequest) CacheInfo() cache.RequestInfo {
+	info := cache.RequestInfo{
+		Token:          r.Token,
+		Datacenter:     r.Datacenter,
+		MinIndex:       r.MinQueryIndex,
+		Timeout:        r.MaxQueryTime,
+		MaxAge:         r.MaxAge,
+		MustRevalidate: r.MustRevalidate,
+	}
+
+	// When we are not using the service kind we want to normalize the ServiceKind
+	keyKind := ServiceKindTypical
+	if r.UseServiceKind {
+		keyKind = r.ServiceKind
+	}
+	// To calculate the cache key we only hash the node meta filters and the bexpr filter.
+	// The datacenter is handled by the cache framework. The other fields are
+	// not, but should not be used in any cache types.
+	v, err := hashstructure.Hash([]interface{}{
+		keyKind,
+		r.UseServiceKind,
+		r.Filter,
+	}, nil)
+	if err == nil {
+		// If there is an error, we don't set the key. A blank key forces
+		// no cache for this request so the request is forwarded directly
+		// to the server.
+		info.Key = strconv.FormatUint(v, 10)
+	}
+
+	return info
+}
+
+func (r *ServiceDumpRequest) CacheMinIndex() uint64 {
 	return r.QueryOptions.MinQueryIndex
 }
 
@@ -403,6 +487,7 @@ func (r *ServiceSpecificRequest) CacheInfo() cache.RequestInfo {
 		r.ServiceAddress,
 		r.TagFilter,
 		r.Connect,
+		r.Filter,
 	}, nil)
 	if err == nil {
 		// If there is an error, we don't set the key. A blank key forces
@@ -429,6 +514,30 @@ func (r *NodeSpecificRequest) RequestDatacenter() string {
 	return r.Datacenter
 }
 
+func (r *NodeSpecificRequest) CacheInfo() cache.RequestInfo {
+	info := cache.RequestInfo{
+		Token:          r.Token,
+		Datacenter:     r.Datacenter,
+		MinIndex:       r.MinQueryIndex,
+		Timeout:        r.MaxQueryTime,
+		MaxAge:         r.MaxAge,
+		MustRevalidate: r.MustRevalidate,
+	}
+
+	v, err := hashstructure.Hash([]interface{}{
+		r.Node,
+		r.Filter,
+	}, nil)
+	if err == nil {
+		// If there is an error, we don't set the key. A blank key forces
+		// no cache for this request so the request is forwarded directly
+		// to the server.
+		info.Key = strconv.FormatUint(v, 10)
+	}
+
+	return info
+}
+
 // ChecksInStateRequest is used to query for nodes in a state
 type ChecksInStateRequest struct {
 	Datacenter      string
@@ -451,8 +560,18 @@ type Node struct {
 	TaggedAddresses map[string]string
 	Meta            map[string]string
 
-	RaftIndex
+	RaftIndex `bexpr:"-"`
 }
+
+func (n *Node) BestAddress(wan bool) string {
+	if wan {
+		if addr, ok := n.TaggedAddresses["wan"]; ok {
+			return addr
+		}
+	}
+	return n.Address
+}
+
 type Nodes []*Node
 
 // IsSame return whether nodes are similar without taking into account
@@ -549,16 +668,15 @@ type ServiceNode struct {
 	ServiceName              string
 	ServiceTags              []string
 	ServiceAddress           string
+	ServiceTaggedAddresses   map[string]ServiceAddress `json:",omitempty"`
 	ServiceWeights           Weights
 	ServiceMeta              map[string]string
 	ServicePort              int
 	ServiceEnableTagOverride bool
-	// DEPRECATED (ProxyDestination) - remove this when removing ProxyDestination
-	ServiceProxyDestination string
-	ServiceProxy            ConnectProxyConfig
-	ServiceConnect          ServiceConnect
+	ServiceProxy             ConnectProxyConfig
+	ServiceConnect           ServiceConnect
 
-	RaftIndex
+	RaftIndex `bexpr:"-"`
 }
 
 // PartialClone() returns a clone of the given service node, minus the node-
@@ -571,6 +689,14 @@ func (s *ServiceNode) PartialClone() *ServiceNode {
 		nsmeta[k] = v
 	}
 
+	var svcTaggedAddrs map[string]ServiceAddress
+	if len(s.ServiceTaggedAddresses) > 0 {
+		svcTaggedAddrs = make(map[string]ServiceAddress)
+		for k, v := range s.ServiceTaggedAddresses {
+			svcTaggedAddrs[k] = v
+		}
+	}
+
 	return &ServiceNode{
 		// Skip ID, see above.
 		Node: s.Node,
@@ -581,14 +707,13 @@ func (s *ServiceNode) PartialClone() *ServiceNode {
 		ServiceName:              s.ServiceName,
 		ServiceTags:              tags,
 		ServiceAddress:           s.ServiceAddress,
+		ServiceTaggedAddresses:   svcTaggedAddrs,
 		ServicePort:              s.ServicePort,
 		ServiceMeta:              nsmeta,
 		ServiceWeights:           s.ServiceWeights,
 		ServiceEnableTagOverride: s.ServiceEnableTagOverride,
-		// DEPRECATED (ProxyDestination) - remove this when removing ProxyDestination
-		ServiceProxyDestination: s.ServiceProxyDestination,
-		ServiceProxy:            s.ServiceProxy,
-		ServiceConnect:          s.ServiceConnect,
+		ServiceProxy:             s.ServiceProxy,
+		ServiceConnect:           s.ServiceConnect,
 		RaftIndex: RaftIndex{
 			CreateIndex: s.CreateIndex,
 			ModifyIndex: s.ModifyIndex,
@@ -604,6 +729,7 @@ func (s *ServiceNode) ToNodeService() *NodeService {
 		Service:           s.ServiceName,
 		Tags:              s.ServiceTags,
 		Address:           s.ServiceAddress,
+		TaggedAddresses:   s.ServiceTaggedAddresses,
 		Port:              s.ServicePort,
 		Meta:              s.ServiceMeta,
 		Weights:           &s.ServiceWeights,
@@ -639,7 +765,36 @@ const (
 	// service proxies another service within Consul and speaks the connect
 	// protocol.
 	ServiceKindConnectProxy ServiceKind = "connect-proxy"
+
+	// ServiceKindMeshGateway is a Mesh Gateway for the Connect feature. This
+	// service will proxy connections based off the SNI header set by other
+	// connect proxies
+	ServiceKindMeshGateway ServiceKind = "mesh-gateway"
 )
+
+func ServiceKindFromString(kind string) (ServiceKind, error) {
+	switch kind {
+	case string(ServiceKindTypical):
+		return ServiceKindTypical, nil
+	case string(ServiceKindConnectProxy):
+		return ServiceKindConnectProxy, nil
+	case string(ServiceKindMeshGateway):
+		return ServiceKindMeshGateway, nil
+	default:
+		// have to return something and it may as well be typical
+		return ServiceKindTypical, fmt.Errorf("Invalid service kind: %s", kind)
+	}
+}
+
+// Type to hold a address and port of a service
+type ServiceAddress struct {
+	Address string
+	Port    int
+}
+
+func (a ServiceAddress) ToAPIServiceAddress() api.ServiceAddress {
+	return api.ServiceAddress{Address: a.Address, Port: a.Port}
+}
 
 // NodeService is a service provided by a node
 type NodeService struct {
@@ -652,34 +807,16 @@ type NodeService struct {
 	Service           string
 	Tags              []string
 	Address           string
+	TaggedAddresses   map[string]ServiceAddress `json:",omitempty"`
 	Meta              map[string]string
 	Port              int
 	Weights           *Weights
 	EnableTagOverride bool
 
-	// ProxyDestination is DEPRECATED in favor of Proxy.DestinationServiceName.
-	// It's retained since this struct is used to parse input for
-	// /catalog/register but nothing else internal should use it - once
-	// request/config definitions are passes all internal uses of NodeService
-	// should have this empty and use the Proxy.DestinationServiceNames field
-	// below.
-	//
-	// It used to store the name of the service that this service is a Connect
-	// proxy for. This is only valid if Kind is "connect-proxy". The destination
-	// may be a service that isn't present in the catalog. This is expected and
-	// allowed to allow for proxies to come up earlier than their target services.
-	// DEPRECATED (ProxyDestination) - remove this when removing ProxyDestination
-	ProxyDestination string
-
 	// Proxy is the configuration set for Kind = connect-proxy. It is mandatory in
 	// that case and an error to be set for any other kind. This config is part of
-	// a proxy service definition and is distinct from but shares some fields with
-	// the Connect.Proxy which configures a managed proxy as part of the actual
-	// service's definition. This duplication is ugly but seemed better than the
-	// alternative which was to re-use the same struct fields for both cases even
-	// though the semantics are different and the non-shred fields make no sense
-	// in the other case. ProxyConfig may be a more natural name here, but it's
-	// confusing for the UX because one of the fields in ConnectProxyConfig is
+	// a proxy service definition. ProxyConfig may be a more natural name here, but
+	// it's confusing for the UX because one of the fields in ConnectProxyConfig is
 	// also called just "Config"
 	Proxy ConnectProxyConfig
 
@@ -704,9 +841,24 @@ type NodeService struct {
 	// internal only. Right now our agent endpoints return api structs which don't
 	// include it but this is a safety net incase we change that or there is
 	// somewhere this is used in API output.
-	LocallyRegisteredAsSidecar bool `json:"-"`
+	LocallyRegisteredAsSidecar bool `json:"-" bexpr:"-"`
 
-	RaftIndex
+	RaftIndex `bexpr:"-"`
+}
+
+func (ns *NodeService) BestAddress(wan bool) (string, int) {
+	addr := ns.Address
+	port := ns.Port
+
+	if wan {
+		if wan, ok := ns.TaggedAddresses["wan"]; ok {
+			addr = wan.Address
+			if wan.Port != 0 {
+				port = wan.Port
+			}
+		}
+	}
+	return addr, port
 }
 
 // ServiceConnect are the shared Connect settings between all service
@@ -715,11 +867,6 @@ type ServiceConnect struct {
 	// Native is true when this service can natively understand Connect.
 	Native bool `json:",omitempty"`
 
-	// Proxy configures a connect proxy instance for the service. This is
-	// only used for agent service definitions and is invalid for non-agent
-	// (catalog API) definitions.
-	Proxy *ServiceDefinitionConnectProxy `json:",omitempty"`
-
 	// SidecarService is a nested Service Definition to register at the same time.
 	// It's purely a convenience mechanism to allow specifying a sidecar service
 	// along with the application service definition. It's nested nature allows
@@ -727,7 +874,17 @@ type ServiceConnect struct {
 	// boilerplate needed to register a sidecar service separately, but the end
 	// result is identical to just making a second service registration via any
 	// other means.
-	SidecarService *ServiceDefinition `json:",omitempty"`
+	SidecarService *ServiceDefinition `json:",omitempty" bexpr:"-"`
+}
+
+// IsSidecarProxy returns true if the NodeService is a sidecar proxy.
+func (s *NodeService) IsSidecarProxy() bool {
+	return s.Kind == ServiceKindConnectProxy && s.Proxy.DestinationServiceID != ""
+}
+
+func (s *NodeService) IsMeshGateway() bool {
+	// TODO (mesh-gateway) any other things to check?
+	return s.Kind == ServiceKindMeshGateway
 }
 
 // Validate validates the node service configuration.
@@ -741,13 +898,6 @@ func (s *NodeService) Validate() error {
 
 	// ConnectProxy validation
 	if s.Kind == ServiceKindConnectProxy {
-		// DEPRECATED (ProxyDestination) - remove this when removing ProxyDestination
-		// Fixup legacy requests that specify the ProxyDestination still
-		if s.ProxyDestination != "" && s.Proxy.DestinationServiceName == "" {
-			s.Proxy.DestinationServiceName = s.ProxyDestination
-			s.ProxyDestination = ""
-		}
-
 		if strings.TrimSpace(s.Proxy.DestinationServiceName) == "" {
 			result = multierror.Append(result, fmt.Errorf(
 				"Proxy.DestinationServiceName must be non-empty for Connect proxy "+
@@ -763,6 +913,72 @@ func (s *NodeService) Validate() error {
 			result = multierror.Append(result, fmt.Errorf(
 				"A Proxy cannot also be Connect Native, only typical services"))
 		}
+
+		// ensure we don't have multiple upstreams for the same service
+		var (
+			upstreamKeys = make(map[UpstreamKey]struct{})
+			bindAddrs    = make(map[string]struct{})
+		)
+		for _, u := range s.Proxy.Upstreams {
+			if err := u.Validate(); err != nil {
+				result = multierror.Append(result, err)
+				continue
+			}
+
+			uk := u.ToKey()
+			if _, ok := upstreamKeys[uk]; ok {
+				result = multierror.Append(result, fmt.Errorf(
+					"upstreams cannot contain duplicates of %s", uk))
+				continue
+			}
+			upstreamKeys[uk] = struct{}{}
+
+			addr := u.LocalBindAddress
+			if addr == "" {
+				addr = "127.0.0.1"
+			}
+			addr = net.JoinHostPort(addr, fmt.Sprintf("%d", u.LocalBindPort))
+
+			if _, ok := bindAddrs[addr]; ok {
+				result = multierror.Append(result, fmt.Errorf(
+					"upstreams cannot contain duplicates by local bind address and port; %q is specified twice", addr))
+				continue
+			}
+			bindAddrs[addr] = struct{}{}
+		}
+	}
+
+	// MeshGateway validation
+	if s.Kind == ServiceKindMeshGateway {
+		// Gateways must have a port
+		if s.Port == 0 {
+			result = multierror.Append(result, fmt.Errorf("Port must be non-zero for a Mesh Gateway"))
+		}
+
+		// Gateways cannot have sidecars
+		if s.Connect.SidecarService != nil {
+			result = multierror.Append(result, fmt.Errorf("Mesh Gateways cannot have a sidecar service defined"))
+		}
+
+		if s.Proxy.DestinationServiceName != "" {
+			result = multierror.Append(result, fmt.Errorf("The Proxy.DestinationServiceName configuration is invalid for Mesh Gateways"))
+		}
+
+		if s.Proxy.DestinationServiceID != "" {
+			result = multierror.Append(result, fmt.Errorf("The Proxy.DestinationServiceID configuration is invalid for Mesh Gateways"))
+		}
+
+		if s.Proxy.LocalServiceAddress != "" {
+			result = multierror.Append(result, fmt.Errorf("The Proxy.LocalServiceAddress configuration is invalid for Mesh Gateways"))
+		}
+
+		if s.Proxy.LocalServicePort != 0 {
+			result = multierror.Append(result, fmt.Errorf("The Proxy.LocalServicePort configuration is invalid for Mesh Gateways"))
+		}
+
+		if len(s.Proxy.Upstreams) != 0 {
+			result = multierror.Append(result, fmt.Errorf("The Proxy.Upstreams configuration is invalid for Mesh Gateways"))
+		}
 	}
 
 	// Nested sidecar validation
@@ -776,10 +992,6 @@ func (s *NodeService) Validate() error {
 			if s.Connect.SidecarService.Connect.SidecarService != nil {
 				result = multierror.Append(result, fmt.Errorf(
 					"A SidecarService cannot have a nested SidecarService"))
-			}
-			if s.Connect.SidecarService.Connect.Proxy != nil {
-				result = multierror.Append(result, fmt.Errorf(
-					"A SidecarService cannot have a managed proxy"))
 			}
 		}
 	}
@@ -797,6 +1009,7 @@ func (s *NodeService) IsSame(other *NodeService) bool {
 		!reflect.DeepEqual(s.Tags, other.Tags) ||
 		s.Address != other.Address ||
 		s.Port != other.Port ||
+		!reflect.DeepEqual(s.TaggedAddresses, other.TaggedAddresses) ||
 		!reflect.DeepEqual(s.Weights, other.Weights) ||
 		!reflect.DeepEqual(s.Meta, other.Meta) ||
 		s.EnableTagOverride != other.EnableTagOverride ||
@@ -829,11 +1042,11 @@ func (s *ServiceNode) IsSameService(other *ServiceNode) bool {
 		s.ServiceName != other.ServiceName ||
 		!reflect.DeepEqual(s.ServiceTags, other.ServiceTags) ||
 		s.ServiceAddress != other.ServiceAddress ||
+		!reflect.DeepEqual(s.ServiceTaggedAddresses, other.ServiceTaggedAddresses) ||
 		s.ServicePort != other.ServicePort ||
 		!reflect.DeepEqual(s.ServiceMeta, other.ServiceMeta) ||
 		!reflect.DeepEqual(s.ServiceWeights, other.ServiceWeights) ||
 		s.ServiceEnableTagOverride != other.ServiceEnableTagOverride ||
-		s.ServiceProxyDestination != other.ServiceProxyDestination ||
 		!reflect.DeepEqual(s.ServiceProxy, other.ServiceProxy) ||
 		!reflect.DeepEqual(s.ServiceConnect, other.ServiceConnect) {
 		return false
@@ -853,11 +1066,6 @@ func (s *NodeService) ToServiceNode(node string) *ServiceNode {
 			theWeights = *s.Weights
 		}
 	}
-	// DEPRECATED (ProxyDestination) - remove this when removing ProxyDestination
-	legacyProxyDest := s.Proxy.DestinationServiceName
-	if legacyProxyDest == "" {
-		legacyProxyDest = s.ProxyDestination
-	}
 	return &ServiceNode{
 		// Skip ID, see ServiceNode definition.
 		Node: node,
@@ -868,12 +1076,12 @@ func (s *NodeService) ToServiceNode(node string) *ServiceNode {
 		ServiceName:              s.Service,
 		ServiceTags:              s.Tags,
 		ServiceAddress:           s.Address,
+		ServiceTaggedAddresses:   s.TaggedAddresses,
 		ServicePort:              s.Port,
 		ServiceMeta:              s.Meta,
 		ServiceWeights:           theWeights,
 		ServiceEnableTagOverride: s.EnableTagOverride,
 		ServiceProxy:             s.Proxy,
-		ServiceProxyDestination:  legacyProxyDest,
 		ServiceConnect:           s.Connect,
 		RaftIndex: RaftIndex{
 			CreateIndex: s.CreateIndex,
@@ -899,20 +1107,81 @@ type HealthCheck struct {
 	ServiceName string        // optional service name
 	ServiceTags []string      // optional service tags
 
-	Definition HealthCheckDefinition
+	Definition HealthCheckDefinition `bexpr:"-"`
 
-	RaftIndex
+	RaftIndex `bexpr:"-"`
 }
 
 type HealthCheckDefinition struct {
-	HTTP                           string               `json:",omitempty"`
-	TLSSkipVerify                  bool                 `json:",omitempty"`
-	Header                         map[string][]string  `json:",omitempty"`
-	Method                         string               `json:",omitempty"`
-	TCP                            string               `json:",omitempty"`
-	Interval                       api.ReadableDuration `json:",omitempty"`
-	Timeout                        api.ReadableDuration `json:",omitempty"`
-	DeregisterCriticalServiceAfter api.ReadableDuration `json:",omitempty"`
+	HTTP                           string              `json:",omitempty"`
+	TLSSkipVerify                  bool                `json:",omitempty"`
+	Header                         map[string][]string `json:",omitempty"`
+	Method                         string              `json:",omitempty"`
+	TCP                            string              `json:",omitempty"`
+	Interval                       time.Duration       `json:",omitempty"`
+	OutputMaxSize                  uint                `json:",omitempty"`
+	Timeout                        time.Duration       `json:",omitempty"`
+	DeregisterCriticalServiceAfter time.Duration       `json:",omitempty"`
+}
+
+func (d *HealthCheckDefinition) MarshalJSON() ([]byte, error) {
+	type Alias HealthCheckDefinition
+	exported := &struct {
+		Interval                       string `json:",omitempty"`
+		OutputMaxSize                  uint   `json:",omitempty"`
+		Timeout                        string `json:",omitempty"`
+		DeregisterCriticalServiceAfter string `json:",omitempty"`
+		*Alias
+	}{
+		Interval:                       d.Interval.String(),
+		OutputMaxSize:                  d.OutputMaxSize,
+		Timeout:                        d.Timeout.String(),
+		DeregisterCriticalServiceAfter: d.DeregisterCriticalServiceAfter.String(),
+		Alias:                          (*Alias)(d),
+	}
+	if d.Interval == 0 {
+		exported.Interval = ""
+	}
+	if d.Timeout == 0 {
+		exported.Timeout = ""
+	}
+	if d.DeregisterCriticalServiceAfter == 0 {
+		exported.DeregisterCriticalServiceAfter = ""
+	}
+
+	return json.Marshal(exported)
+}
+
+func (d *HealthCheckDefinition) UnmarshalJSON(data []byte) error {
+	type Alias HealthCheckDefinition
+	aux := &struct {
+		Interval                       string
+		Timeout                        string
+		DeregisterCriticalServiceAfter string
+		*Alias
+	}{
+		Alias: (*Alias)(d),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	var err error
+	if aux.Interval != "" {
+		if d.Interval, err = time.ParseDuration(aux.Interval); err != nil {
+			return err
+		}
+	}
+	if aux.Timeout != "" {
+		if d.Timeout, err = time.ParseDuration(aux.Timeout); err != nil {
+			return err
+		}
+	}
+	if aux.DeregisterCriticalServiceAfter != "" {
+		if d.DeregisterCriticalServiceAfter, err = time.ParseDuration(aux.DeregisterCriticalServiceAfter); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // IsSame checks if one HealthCheck is the same as another, without looking
@@ -928,14 +1197,16 @@ func (c *HealthCheck) IsSame(other *HealthCheck) bool {
 		c.Output != other.Output ||
 		c.ServiceID != other.ServiceID ||
 		c.ServiceName != other.ServiceName ||
-		!reflect.DeepEqual(c.ServiceTags, other.ServiceTags) {
+		!reflect.DeepEqual(c.ServiceTags, other.ServiceTags) ||
+		!reflect.DeepEqual(c.Definition, other.Definition) {
 		return false
 	}
 
 	return true
 }
 
-// Clone returns a distinct clone of the HealthCheck.
+// Clone returns a distinct clone of the HealthCheck. Note that the
+// "ServiceTags" and "Definition.Header" field are not deep copied.
 func (c *HealthCheck) Clone() *HealthCheck {
 	clone := new(HealthCheck)
 	*clone = *c
@@ -952,6 +1223,28 @@ type CheckServiceNode struct {
 	Service *NodeService
 	Checks  HealthChecks
 }
+
+func (csn *CheckServiceNode) BestAddress(wan bool) (string, int) {
+	// TODO (mesh-gateway) needs a test
+	// best address
+	// wan
+	//   wan svc addr
+	//   svc addr
+	//   wan node addr
+	//   node addr
+	// lan
+	//   svc addr
+	//   node addr
+
+	addr, port := csn.Service.BestAddress(wan)
+
+	if addr == "" {
+		addr = csn.Node.BestAddress(wan)
+	}
+
+	return addr, port
+}
+
 type CheckServiceNodes []CheckServiceNode
 
 // Shuffle does an in-place random shuffle using the Fisher-Yates algorithm.
@@ -1055,6 +1348,150 @@ type IndexedNodeDump struct {
 	QueryMeta
 }
 
+// IndexedConfigEntries has its own encoding logic which differs from
+// ConfigEntryRequest as it has to send a slice of ConfigEntry.
+type IndexedConfigEntries struct {
+	Kind    string
+	Entries []ConfigEntry
+	QueryMeta
+}
+
+func (c *IndexedConfigEntries) MarshalBinary() (data []byte, err error) {
+	// bs will grow if needed but allocate enough to avoid reallocation in common
+	// case.
+	bs := make([]byte, 128)
+	enc := codec.NewEncoderBytes(&bs, msgpackHandle)
+
+	// Encode length.
+	err = enc.Encode(len(c.Entries))
+	if err != nil {
+		return nil, err
+	}
+
+	// Encode kind.
+	err = enc.Encode(c.Kind)
+	if err != nil {
+		return nil, err
+	}
+
+	// Then actual value using alias trick to avoid infinite recursion
+	type Alias IndexedConfigEntries
+	err = enc.Encode(struct {
+		*Alias
+	}{
+		Alias: (*Alias)(c),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return bs, nil
+}
+
+func (c *IndexedConfigEntries) UnmarshalBinary(data []byte) error {
+	// First decode the number of entries.
+	var numEntries int
+	dec := codec.NewDecoderBytes(data, msgpackHandle)
+	if err := dec.Decode(&numEntries); err != nil {
+		return err
+	}
+
+	// Next decode the kind.
+	var kind string
+	if err := dec.Decode(&kind); err != nil {
+		return err
+	}
+
+	// Then decode the slice of ConfigEntries
+	c.Entries = make([]ConfigEntry, numEntries)
+	for i := 0; i < numEntries; i++ {
+		entry, err := MakeConfigEntry(kind, "")
+		if err != nil {
+			return err
+		}
+		c.Entries[i] = entry
+	}
+
+	// Alias juggling to prevent infinite recursive calls back to this decode
+	// method.
+	type Alias IndexedConfigEntries
+	as := struct {
+		*Alias
+	}{
+		Alias: (*Alias)(c),
+	}
+	if err := dec.Decode(&as); err != nil {
+		return err
+	}
+	return nil
+}
+
+type IndexedGenericConfigEntries struct {
+	Entries []ConfigEntry
+	QueryMeta
+}
+
+func (c *IndexedGenericConfigEntries) MarshalBinary() (data []byte, err error) {
+	// bs will grow if needed but allocate enough to avoid reallocation in common
+	// case.
+	bs := make([]byte, 128)
+	enc := codec.NewEncoderBytes(&bs, msgpackHandle)
+
+	if err := enc.Encode(len(c.Entries)); err != nil {
+		return nil, err
+	}
+
+	for _, entry := range c.Entries {
+		if err := enc.Encode(entry.GetKind()); err != nil {
+			return nil, err
+		}
+		if err := enc.Encode(entry); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := enc.Encode(c.QueryMeta); err != nil {
+		return nil, err
+	}
+
+	return bs, nil
+}
+
+func (c *IndexedGenericConfigEntries) UnmarshalBinary(data []byte) error {
+	// First decode the number of entries.
+	var numEntries int
+	dec := codec.NewDecoderBytes(data, msgpackHandle)
+	if err := dec.Decode(&numEntries); err != nil {
+		return err
+	}
+
+	// Then decode the slice of ConfigEntries
+	c.Entries = make([]ConfigEntry, numEntries)
+	for i := 0; i < numEntries; i++ {
+		var kind string
+		if err := dec.Decode(&kind); err != nil {
+			return err
+		}
+
+		entry, err := MakeConfigEntry(kind, "")
+		if err != nil {
+			return err
+		}
+
+		if err := dec.Decode(entry); err != nil {
+			return err
+		}
+
+		c.Entries[i] = entry
+	}
+
+	if err := dec.Decode(&c.QueryMeta); err != nil {
+		return err
+	}
+
+	return nil
+
+}
+
 // DirEntry is used to represent a directory entry. This is
 // used for values in our Key-Value store.
 type DirEntry struct {
@@ -1080,6 +1517,14 @@ func (d *DirEntry) Clone() *DirEntry {
 			ModifyIndex: d.ModifyIndex,
 		},
 	}
+}
+
+func (d *DirEntry) Equal(o *DirEntry) bool {
+	return d.LockIndex == o.LockIndex &&
+		d.Key == o.Key &&
+		d.Flags == o.Flags &&
+		bytes.Equal(d.Value, o.Value) &&
+		d.Session == o.Session
 }
 
 type DirEntries []*DirEntry
@@ -1324,6 +1769,7 @@ type KeyringRequest struct {
 	Datacenter  string
 	Forwarded   bool
 	RelayFactor uint8
+	LocalOnly   bool
 	QueryOptions
 }
 

@@ -41,7 +41,7 @@ func (c *cmd) init() {
 	c.flags = flag.NewFlagSet("", flag.ContinueOnError)
 	c.flags.BoolVar(&c.showMeta, "meta", false, "Indicates that policy metadata such "+
 		"as the content hash and raft indices should be shown for each entry")
-	c.flags.StringVar(&c.name, "name", "", "The new policies name. This flag is required.")
+	c.flags.StringVar(&c.name, "name", "", "The new policy's name. This flag is required.")
 	c.flags.StringVar(&c.description, "description", "", "A description of the policy")
 	c.flags.Var((*flags.AppendSliceValue)(&c.datacenters), "valid-datacenter", "Datacenter "+
 		"that the policy should be valid within. This flag may be specified multiple times")
@@ -131,7 +131,7 @@ func (c *cmd) Help() string {
 	return flags.Usage(c.help, nil)
 }
 
-const synopsis = "Create an ACL Policy"
+const synopsis = "Create an ACL policy"
 const help = `
 Usage: consul acl policy create -name NAME [options]
 
@@ -151,6 +151,6 @@ Usage: consul acl policy create -name NAME [options]
     Creation a policy from a legacy token:
 
         $ consul acl policy create -name "legacy-policy" \
-                                   -description "Token Converted to Policy" \
+                                   -description "Token Converted to policy" \
                                    -from-token "c1e34113-e7ab-4451-b1a6-336ddcc58fc6"
 `

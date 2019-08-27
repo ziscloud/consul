@@ -6,6 +6,7 @@ import (
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/consul/state"
 	"github.com/hashicorp/consul/agent/structs"
+	bexpr "github.com/hashicorp/go-bexpr"
 	"github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/serf/serf"
@@ -46,6 +47,11 @@ func (m *Internal) NodeDump(args *structs.DCSpecificRequest,
 		return err
 	}
 
+	filter, err := bexpr.CreateFilter(args.Filter, nil, reply.Dump)
+	if err != nil {
+		return err
+	}
+
 	return m.srv.blockingQuery(
 		&args.QueryOptions,
 		&reply.QueryMeta,
@@ -56,7 +62,51 @@ func (m *Internal) NodeDump(args *structs.DCSpecificRequest,
 			}
 
 			reply.Index, reply.Dump = index, dump
-			return m.srv.filterACL(args.Token, reply)
+			if err := m.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+
+			raw, err := filter.Execute(reply.Dump)
+			if err != nil {
+				return err
+			}
+
+			reply.Dump = raw.(structs.NodeDump)
+			return nil
+		})
+}
+
+func (m *Internal) ServiceDump(args *structs.ServiceDumpRequest, reply *structs.IndexedCheckServiceNodes) error {
+	if done, err := m.srv.forward("Internal.ServiceDump", args, args, reply); done {
+		return err
+	}
+
+	filter, err := bexpr.CreateFilter(args.Filter, nil, reply.Nodes)
+	if err != nil {
+		return err
+	}
+
+	return m.srv.blockingQuery(
+		&args.QueryOptions,
+		&reply.QueryMeta,
+		func(ws memdb.WatchSet, state *state.Store) error {
+			index, nodes, err := state.ServiceDump(ws, args.ServiceKind, args.UseServiceKind)
+			if err != nil {
+				return err
+			}
+
+			reply.Index, reply.Nodes = index, nodes
+			if err := m.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+
+			raw, err := filter.Execute(reply.Nodes)
+			if err != nil {
+				return err
+			}
+
+			reply.Nodes = raw.(structs.CheckServiceNodes)
+			return nil
 		})
 }
 
@@ -128,11 +178,20 @@ func (m *Internal) KeyringOperation(
 		}
 	}
 
-	// Only perform WAN keyring querying and RPC forwarding once
-	if !args.Forwarded && m.srv.serfWAN != nil {
-		args.Forwarded = true
-		m.executeKeyringOp(args, reply, true)
-		return m.srv.globalRPC("Internal.KeyringOperation", args, reply)
+	// Validate use of local-only
+	if args.LocalOnly && args.Operation != structs.KeyringList {
+		// Error aggressively to be clear about LocalOnly behavior
+		return fmt.Errorf("argument error: LocalOnly can only be used for List operations")
+	}
+
+	// args.LocalOnly should always be false for non-GET requests
+	if !args.LocalOnly {
+		// Only perform WAN keyring querying and RPC forwarding once
+		if !args.Forwarded && m.srv.serfWAN != nil {
+			args.Forwarded = true
+			m.executeKeyringOp(args, reply, true)
+			return m.srv.globalRPC("Internal.KeyringOperation", args, reply)
+		}
 	}
 
 	// Query the LAN keyring of this node's DC

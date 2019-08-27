@@ -9,10 +9,10 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/agent/structs"
-	"github.com/hashicorp/consul/lib/freeport"
+	"github.com/hashicorp/consul/sdk/freeport"
+	"github.com/hashicorp/consul/sdk/testutil"
+	"github.com/hashicorp/consul/sdk/testutil/retry"
 	"github.com/hashicorp/consul/testrpc"
-	"github.com/hashicorp/consul/testutil"
-	"github.com/hashicorp/consul/testutil/retry"
 	"github.com/hashicorp/net-rpc-msgpackrpc"
 	"github.com/hashicorp/serf/serf"
 	"github.com/stretchr/testify/require"
@@ -84,8 +84,10 @@ func TestClient_JoinLAN(t *testing.T) {
 	defer os.RemoveAll(dir2)
 	defer c1.Shutdown()
 
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
 	// Try to join
 	joinLAN(t, c1, s1)
+	testrpc.WaitForTestAgent(t, c1.RPC, "dc1")
 	retry.Run(t, func(r *retry.R) {
 		if got, want := c1.routers.NumServers(), 1; got != want {
 			r.Fatalf("got %d servers want %d", got, want)
@@ -96,6 +98,47 @@ func TestClient_JoinLAN(t *testing.T) {
 		if got, want := len(c1.LANMembers()), 2; got != want {
 			r.Fatalf("got %d client LAN members want %d", got, want)
 		}
+	})
+}
+
+func TestClient_LANReap(t *testing.T) {
+	t.Parallel()
+	dir1, s1 := testServer(t)
+	defer os.RemoveAll(dir1)
+
+	dir2, c1 := testClientWithConfig(t, func(c *Config) {
+		c.Datacenter = "dc1"
+		c.SerfFloodInterval = 100 * time.Millisecond
+		c.SerfLANConfig.ReconnectTimeout = 250 * time.Millisecond
+		c.SerfLANConfig.TombstoneTimeout = 250 * time.Millisecond
+		c.SerfLANConfig.ReapInterval = 500 * time.Millisecond
+	})
+	defer os.RemoveAll(dir2)
+	defer c1.Shutdown()
+
+	// Try to join
+	joinLAN(t, c1, s1)
+	testrpc.WaitForLeader(t, c1.RPC, "dc1")
+
+	retry.Run(t, func(r *retry.R) {
+		require.Len(r, s1.LANMembers(), 2)
+		require.Len(r, c1.LANMembers(), 2)
+	})
+
+	// Check the router has both
+	retry.Run(t, func(r *retry.R) {
+		server := c1.routers.FindServer()
+		require.NotNil(t, server)
+		require.Equal(t, s1.config.NodeName, server.Name)
+	})
+
+	// shutdown the second dc
+	s1.Shutdown()
+
+	retry.Run(t, func(r *retry.R) {
+		require.Len(r, c1.LANMembers(), 1)
+		server := c1.routers.FindServer()
+		require.Nil(t, server)
 	})
 }
 

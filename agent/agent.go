@@ -20,30 +20,30 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/armon/go-metrics"
+	metrics "github.com/armon/go-metrics"
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/ae"
 	"github.com/hashicorp/consul/agent/cache"
-	"github.com/hashicorp/consul/agent/cache-types"
+	cachetype "github.com/hashicorp/consul/agent/cache-types"
 	"github.com/hashicorp/consul/agent/checks"
 	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/agent/consul"
 	"github.com/hashicorp/consul/agent/local"
 	"github.com/hashicorp/consul/agent/proxycfg"
-	"github.com/hashicorp/consul/agent/proxyprocess"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/agent/systemd"
 	"github.com/hashicorp/consul/agent/token"
 	"github.com/hashicorp/consul/agent/xds"
 	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/api/watch"
 	"github.com/hashicorp/consul/ipaddr"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/consul/lib/file"
 	"github.com/hashicorp/consul/logger"
+	"github.com/hashicorp/consul/tlsutil"
 	"github.com/hashicorp/consul/types"
-	"github.com/hashicorp/consul/watch"
-	"github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/go-uuid"
+	multierror "github.com/hashicorp/go-multierror"
+	uuid "github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/memberlist"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
@@ -62,11 +62,20 @@ const (
 	checksDir     = "checks"
 	checkStateDir = "checks/state"
 
+	// Name of the file tokens will be persisted within
+	tokensPath = "acl-tokens.json"
+
 	// Default reasons for node/service maintenance mode
 	defaultNodeMaintReason = "Maintenance mode is enabled for this node, " +
 		"but no reason was provided. This is a default message."
 	defaultServiceMaintReason = "Maintenance mode is enabled for this " +
 		"service, but no reason was provided. This is a default message."
+
+	// ID of the roots watch
+	rootsWatchID = "roots"
+
+	// ID of the leaf watch
+	leafWatchID = "leaf"
 )
 
 type configSource int
@@ -174,8 +183,8 @@ type Agent struct {
 	// checkAliases maps the check ID to an associated Alias checks
 	checkAliases map[types.CheckID]*checks.CheckAlias
 
-	// checkLock protects updates to the check* maps
-	checkLock sync.Mutex
+	// stateLock protects the agent state
+	stateLock sync.Mutex
 
 	// dockerClient is the client for performing docker health checks.
 	dockerClient *checks.DockerClient
@@ -197,6 +206,8 @@ type Agent struct {
 	shutdown     bool
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
+
+	InterruptStartCh chan struct{}
 
 	// joinLANNotifier is called after a successful JoinLAN.
 	joinLANNotifier notifier
@@ -229,19 +240,15 @@ type Agent struct {
 	// the configuration directly.
 	tokens *token.Store
 
-	// proxyManager is the proxy process manager for managed Connect proxies.
-	proxyManager *proxyprocess.Manager
-
-	// proxyLock protects _managed_ proxy information in the local state from
-	// concurrent modification. It is not needed to work with proxyConfig state.
-	proxyLock sync.Mutex
-
 	// proxyConfig is the manager for proxy service (Kind = connect-proxy)
 	// configuration state. This ensures all state needed by a proxy registration
 	// is maintained in cache and handles pushing updates to that state into XDS
-	// server to be pushed out to Envoy. This is NOT related to managed proxies
-	// directly.
+	// server to be pushed out to Envoy.
 	proxyConfig *proxycfg.Manager
+
+	// serviceManager is the manager for combining local service registrations with
+	// the centrally configured proxy/service defaults.
+	serviceManager *ServiceManager
 
 	// xdsServer is the Server instance that serves xDS gRPC API.
 	xdsServer *xds.Server
@@ -249,9 +256,18 @@ type Agent struct {
 	// grpcServer is the server instance used currently to serve xDS API for
 	// Envoy.
 	grpcServer *grpc.Server
+
+	// tlsConfigurator is the central instance to provide a *tls.Config
+	// based on the current consul configuration.
+	tlsConfigurator *tlsutil.Configurator
+
+	// persistedTokensLock is used to synchronize access to the persisted token
+	// store within the data directory. This will prevent loading while writing as
+	// well as multiple concurrent writes.
+	persistedTokensLock sync.RWMutex
 }
 
-func New(c *config.RuntimeConfig) (*Agent, error) {
+func New(c *config.RuntimeConfig, logger *log.Logger) (*Agent, error) {
 	if c.Datacenter == "" {
 		return nil, fmt.Errorf("Must configure a Datacenter")
 	}
@@ -259,37 +275,40 @@ func New(c *config.RuntimeConfig) (*Agent, error) {
 		return nil, fmt.Errorf("Must configure a DataDir")
 	}
 
-	a := &Agent{
-		config:          c,
-		checkReapAfter:  make(map[types.CheckID]time.Duration),
-		checkMonitors:   make(map[types.CheckID]*checks.CheckMonitor),
-		checkTTLs:       make(map[types.CheckID]*checks.CheckTTL),
-		checkHTTPs:      make(map[types.CheckID]*checks.CheckHTTP),
-		checkTCPs:       make(map[types.CheckID]*checks.CheckTCP),
-		checkGRPCs:      make(map[types.CheckID]*checks.CheckGRPC),
-		checkDockers:    make(map[types.CheckID]*checks.CheckDocker),
-		checkAliases:    make(map[types.CheckID]*checks.CheckAlias),
-		eventCh:         make(chan serf.UserEvent, 1024),
-		eventBuf:        make([]*UserEvent, 256),
-		joinLANNotifier: &systemd.Notifier{},
-		reloadCh:        make(chan chan error),
-		retryJoinCh:     make(chan error),
-		shutdownCh:      make(chan struct{}),
-		endpoints:       make(map[string]string),
-		tokens:          new(token.Store),
+	a := Agent{
+		config:           c,
+		checkReapAfter:   make(map[types.CheckID]time.Duration),
+		checkMonitors:    make(map[types.CheckID]*checks.CheckMonitor),
+		checkTTLs:        make(map[types.CheckID]*checks.CheckTTL),
+		checkHTTPs:       make(map[types.CheckID]*checks.CheckHTTP),
+		checkTCPs:        make(map[types.CheckID]*checks.CheckTCP),
+		checkGRPCs:       make(map[types.CheckID]*checks.CheckGRPC),
+		checkDockers:     make(map[types.CheckID]*checks.CheckDocker),
+		checkAliases:     make(map[types.CheckID]*checks.CheckAlias),
+		eventCh:          make(chan serf.UserEvent, 1024),
+		eventBuf:         make([]*UserEvent, 256),
+		joinLANNotifier:  &systemd.Notifier{},
+		reloadCh:         make(chan chan error),
+		retryJoinCh:      make(chan error),
+		shutdownCh:       make(chan struct{}),
+		InterruptStartCh: make(chan struct{}),
+		endpoints:        make(map[string]string),
+		tokens:           new(token.Store),
+		logger:           logger,
 	}
+	a.serviceManager = NewServiceManager(&a)
 
 	if err := a.initializeACLs(); err != nil {
 		return nil, err
 	}
 
-	// Set up the initial state of the token store based on the config.
-	a.tokens.UpdateUserToken(a.config.ACLToken)
-	a.tokens.UpdateAgentToken(a.config.ACLAgentToken)
-	a.tokens.UpdateAgentMasterToken(a.config.ACLAgentMasterToken)
-	a.tokens.UpdateACLReplicationToken(a.config.ACLReplicationToken)
+	// Retrieve or generate the node ID before setting up the rest of the
+	// agent, which depends on it.
+	if err := a.setupNodeID(c); err != nil {
+		return nil, fmt.Errorf("Failed to setup node ID: %v", err)
+	}
 
-	return a, nil
+	return &a, nil
 }
 
 func LocalConfig(cfg *config.RuntimeConfig) local.Config {
@@ -301,8 +320,6 @@ func LocalConfig(cfg *config.RuntimeConfig) local.Config {
 		NodeID:              cfg.NodeID,
 		NodeName:            cfg.NodeName,
 		TaggedAddresses:     map[string]string{},
-		ProxyBindMinPort:    cfg.ConnectProxyBindMinPort,
-		ProxyBindMaxPort:    cfg.ConnectProxyBindMaxPort,
 	}
 	for k, v := range cfg.TaggedAddresses {
 		lc.TaggedAddresses[k] = v
@@ -310,46 +327,11 @@ func LocalConfig(cfg *config.RuntimeConfig) local.Config {
 	return lc
 }
 
-func (a *Agent) setupProxyManager() error {
-	acfg, err := a.config.APIConfig(true)
-	if err != nil {
-		return fmt.Errorf("[INFO] agent: Connect managed proxies are disabled due to providing an invalid HTTP configuration")
-	}
-	a.proxyManager = proxyprocess.NewManager()
-	a.proxyManager.AllowRoot = a.config.ConnectProxyAllowManagedRoot
-	a.proxyManager.State = a.State
-	a.proxyManager.Logger = a.logger
-	if a.config.DataDir != "" {
-		// DataDir is required for all non-dev mode agents, but we want
-		// to allow setting the data dir for demos and so on for the agent,
-		// so do the check above instead.
-		a.proxyManager.DataDir = filepath.Join(a.config.DataDir, "proxy")
-
-		// Restore from our snapshot (if it exists)
-		if err := a.proxyManager.Restore(a.proxyManager.SnapshotPath()); err != nil {
-			a.logger.Printf("[WARN] agent: error restoring proxy state: %s", err)
-		}
-	}
-	a.proxyManager.ProxyEnv = acfg.GenerateEnv()
-	return nil
-}
-
 func (a *Agent) Start() error {
+	a.stateLock.Lock()
+	defer a.stateLock.Unlock()
+
 	c := a.config
-
-	logOutput := a.LogOutput
-	if a.logger == nil {
-		if logOutput == nil {
-			logOutput = os.Stderr
-		}
-		a.logger = log.New(logOutput, "", log.LstdFlags)
-	}
-
-	// Retrieve or generate the node ID before setting up the rest of the
-	// agent, which depends on it.
-	if err := a.setupNodeID(c); err != nil {
-		return fmt.Errorf("Failed to setup node ID: %v", err)
-	}
 
 	// Warn if the node name is incompatible with DNS
 	if InvalidDnsRe.MatchString(a.config.NodeName) {
@@ -361,6 +343,10 @@ func (a *Agent) Start() error {
 			"via DNS due to it being too long. Valid lengths are between "+
 			"1 and 63 bytes.", a.config.NodeName)
 	}
+
+	// load the tokens - this requires the logger to be setup
+	// which is why we can't do this in New
+	a.loadTokens(a.config)
 
 	// create the local state
 	a.State = local.NewState(LocalConfig(c), a.logger, a.tokens)
@@ -383,15 +369,21 @@ func (a *Agent) Start() error {
 	// waiting to discover a consul server
 	consulCfg.ServerUp = a.sync.SyncFull.Trigger
 
+	tlsConfigurator, err := tlsutil.NewConfigurator(c.ToTLSUtilConfig(), a.logger)
+	if err != nil {
+		return err
+	}
+	a.tlsConfigurator = tlsConfigurator
+
 	// Setup either the client or the server.
 	if c.ServerMode {
-		server, err := consul.NewServerLogger(consulCfg, a.logger, a.tokens)
+		server, err := consul.NewServerLogger(consulCfg, a.logger, a.tokens, a.tlsConfigurator)
 		if err != nil {
 			return fmt.Errorf("Failed to start Consul server: %v", err)
 		}
 		a.delegate = server
 	} else {
-		client, err := consul.NewClientLogger(consulCfg, a.logger)
+		client, err := consul.NewClientLogger(consulCfg, a.logger, a.tlsConfigurator)
 		if err != nil {
 			return fmt.Errorf("Failed to start Consul client: %v", err)
 		}
@@ -412,29 +404,30 @@ func (a *Agent) Start() error {
 	// populated from above.
 	a.registerCache()
 
+	if a.config.AutoEncryptTLS && !a.config.ServerMode {
+		reply, err := a.setupClientAutoEncrypt()
+		if err != nil {
+			return fmt.Errorf("AutoEncrypt failed: %s", err)
+		}
+		rootsReq, leafReq, err := a.setupClientAutoEncryptCache(reply)
+		if err != nil {
+			return fmt.Errorf("AutoEncrypt failed: %s", err)
+		}
+		if err = a.setupClientAutoEncryptWatching(rootsReq, leafReq); err != nil {
+			return fmt.Errorf("AutoEncrypt failed: %s", err)
+		}
+		a.logger.Printf("[INFO] AutoEncrypt: upgraded to TLS")
+	}
+
 	// Load checks/services/metadata.
 	if err := a.loadServices(c); err != nil {
 		return err
 	}
-	if err := a.loadProxies(c); err != nil {
-		return err
-	}
-	if err := a.loadChecks(c); err != nil {
+	if err := a.loadChecks(c, nil); err != nil {
 		return err
 	}
 	if err := a.loadMetadata(c); err != nil {
 		return err
-	}
-
-	// create the proxy process manager and start it. This is purposely
-	// done here after the local state above is loaded in so we can have
-	// a more accurate initial state view.
-	if !c.ConnectTestDisableManagedProxies {
-		if err := a.setupProxyManager(); err != nil {
-			a.logger.Printf(err.Error())
-		} else {
-			go a.proxyManager.Run()
-		}
 	}
 
 	// Start the proxy config manager.
@@ -511,6 +504,158 @@ func (a *Agent) Start() error {
 	return nil
 }
 
+func (a *Agent) setupClientAutoEncrypt() (*structs.SignedResponse, error) {
+	client := a.delegate.(*consul.Client)
+
+	addrs := a.config.StartJoinAddrsLAN
+	disco, err := newDiscover()
+	if err != nil && len(addrs) == 0 {
+		return nil, err
+	}
+	addrs = append(addrs, retryJoinAddrs(disco, "LAN", a.config.RetryJoinLAN, a.logger)...)
+
+	reply, priv, err := client.RequestAutoEncryptCerts(addrs, a.config.ServerPort, a.tokens.AgentToken(), a.InterruptStartCh)
+	if err != nil {
+		return nil, err
+	}
+
+	connectCAPems := []string{}
+	for _, ca := range reply.ConnectCARoots.Roots {
+		connectCAPems = append(connectCAPems, ca.RootCert)
+	}
+	if err := a.tlsConfigurator.UpdateAutoEncrypt(reply.ManualCARoots, connectCAPems, reply.IssuedCert.CertPEM, priv, reply.VerifyServerHostname); err != nil {
+		return nil, err
+	}
+	return reply, nil
+
+}
+
+func (a *Agent) setupClientAutoEncryptCache(reply *structs.SignedResponse) (*structs.DCSpecificRequest, *cachetype.ConnectCALeafRequest, error) {
+	rootsReq := &structs.DCSpecificRequest{
+		Datacenter:   a.config.Datacenter,
+		QueryOptions: structs.QueryOptions{Token: a.tokens.AgentToken()},
+	}
+
+	// prepolutate roots cache
+	rootRes := cache.FetchResult{Value: &reply.ConnectCARoots, Index: reply.ConnectCARoots.QueryMeta.Index}
+	if err := a.cache.Prepopulate(cachetype.ConnectCARootName, rootRes, a.config.Datacenter, a.tokens.AgentToken(), rootsReq.CacheInfo().Key); err != nil {
+		return nil, nil, err
+	}
+
+	leafReq := &cachetype.ConnectCALeafRequest{
+		Datacenter: a.config.Datacenter,
+		Token:      a.tokens.AgentToken(),
+		Agent:      a.config.NodeName,
+	}
+
+	// prepolutate leaf cache
+	certRes := cache.FetchResult{Value: &reply.IssuedCert, Index: reply.ConnectCARoots.QueryMeta.Index}
+	if err := a.cache.Prepopulate(cachetype.ConnectCALeafName, certRes, a.config.Datacenter, a.tokens.AgentToken(), leafReq.Key()); err != nil {
+		return nil, nil, err
+	}
+	return rootsReq, leafReq, nil
+}
+
+func (a *Agent) setupClientAutoEncryptWatching(rootsReq *structs.DCSpecificRequest, leafReq *cachetype.ConnectCALeafRequest) error {
+	// setup watches
+	ch := make(chan cache.UpdateEvent, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Watch for root changes
+	err := a.cache.Notify(ctx, cachetype.ConnectCARootName, rootsReq, rootsWatchID, ch)
+	if err != nil {
+		cancel()
+		return err
+	}
+
+	// Watch the leaf cert
+	err = a.cache.Notify(ctx, cachetype.ConnectCALeafName, leafReq, leafWatchID, ch)
+	if err != nil {
+		cancel()
+		return err
+	}
+
+	// Setup actions in case the watches are firing.
+	go func() {
+		for {
+			select {
+			case <-a.shutdownCh:
+				cancel()
+				return
+			case <-ctx.Done():
+				return
+			case u := <-ch:
+				switch u.CorrelationID {
+				case rootsWatchID:
+					roots, ok := u.Result.(*structs.IndexedCARoots)
+					if !ok {
+						err := fmt.Errorf("invalid type for roots response: %T", u.Result)
+						a.logger.Printf("[ERR] %s watch error: %s", u.CorrelationID, err)
+						continue
+					}
+					pems := []string{}
+					for _, root := range roots.Roots {
+						pems = append(pems, root.RootCert)
+					}
+					a.tlsConfigurator.UpdateAutoEncryptCA(pems)
+				case leafWatchID:
+					leaf, ok := u.Result.(*structs.IssuedCert)
+					if !ok {
+						err := fmt.Errorf("invalid type for leaf response: %T", u.Result)
+						a.logger.Printf("[ERR] %s watch error: %s", u.CorrelationID, err)
+						continue
+					}
+					a.tlsConfigurator.UpdateAutoEncryptCert(leaf.CertPEM, leaf.PrivateKeyPEM)
+				}
+			}
+		}
+	}()
+
+	// Setup safety net in case the auto_encrypt cert doesn't get renewed
+	// in time. The agent would be stuck in that case because the watches
+	// never use the AutoEncrypt.Sign endpoint.
+	go func() {
+		for {
+
+			// Check 10sec after cert expires. The agent cache
+			// should be handling the expiration and renew before
+			// it.
+			// If there is no cert, AutoEncryptCertNotAfter returns
+			// a value in the past which immediately triggers the
+			// renew, but this case shouldn't happen because at
+			// this point, auto_encrypt was just being setup
+			// successfully.
+			interval := a.tlsConfigurator.AutoEncryptCertNotAfter().Sub(time.Now().Add(10 * time.Second))
+			a.logger.Printf("[DEBUG] AutoEncrypt: client certificate expiration check in %s", interval)
+			select {
+			case <-a.shutdownCh:
+				return
+			case <-time.After(interval):
+				// check auto encrypt client cert expiration
+				if a.tlsConfigurator.AutoEncryptCertExpired() {
+					a.logger.Printf("[DEBUG] AutoEncrypt: client certificate expired.")
+					reply, err := a.setupClientAutoEncrypt()
+					if err != nil {
+						a.logger.Printf("[ERR] AutoEncrypt: client certificate expired, failed to renew: %s", err)
+						// in case of an error, try again in one minute
+						interval = time.Minute
+						continue
+					}
+					_, _, err = a.setupClientAutoEncryptCache(reply)
+					if err != nil {
+						a.logger.Printf("[ERR] AutoEncrypt: client certificate expired, failed to populate cache: %s", err)
+						// in case of an error, try again in one minute
+						interval = time.Minute
+						continue
+					}
+				}
+			}
+		}
+	}()
+
+	return nil
+}
+
 func (a *Agent) listenAndServeGRPC() error {
 	if len(a.config.GRPCAddrs) < 1 {
 		return nil
@@ -522,8 +667,16 @@ func (a *Agent) listenAndServeGRPC() error {
 		Authz:        a,
 		ResolveToken: a.resolveToken,
 	}
+	a.xdsServer.Initialize()
+
 	var err error
-	a.grpcServer, err = a.xdsServer.GRPCServer(a.config.CertFile, a.config.KeyFile)
+	if a.config.HTTPSPort > 0 {
+		// gRPC uses the same TLS settings as the HTTPS API. If HTTPS is
+		// enabled then gRPC will require HTTPS as well.
+		a.grpcServer, err = a.xdsServer.GRPCServer(a.config.CertFile, a.config.KeyFile)
+	} else {
+		a.grpcServer, err = a.xdsServer.GRPCServer("", "")
+	}
 	if err != nil {
 		return err
 	}
@@ -575,6 +728,7 @@ func (a *Agent) listenAndServeDNS() error {
 		select {
 		case addr := <-notif:
 			a.logger.Printf("[INFO] agent: Started DNS server %s (%s)", addr.String(), addr.Network())
+
 		case err := <-errCh:
 			merr = multierror.Append(merr, err)
 		case <-timeout:
@@ -641,10 +795,7 @@ func (a *Agent) listenHTTP() ([]*HTTPServer, error) {
 			var tlscfg *tls.Config
 			_, isTCP := l.(*tcpKeepAliveListener)
 			if isTCP && proto == "https" {
-				tlscfg, err = a.config.IncomingHTTPSConfig()
-				if err != nil {
-					return err
-				}
+				tlscfg = a.tlsConfigurator.IncomingHTTPSConfig()
 				l = tls.NewListener(l, tlscfg)
 			}
 			srv := &HTTPServer{
@@ -888,6 +1039,7 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 	base.CoordinateUpdateBatchSize = a.config.ConsulCoordinateUpdateBatchSize
 	base.CoordinateUpdateMaxBatches = a.config.ConsulCoordinateUpdateMaxBatches
 	base.CoordinateUpdatePeriod = a.config.ConsulCoordinateUpdatePeriod
+	base.CheckOutputMaxSize = a.config.CheckOutputMaxSize
 
 	base.RaftConfig.HeartbeatTimeout = a.config.ConsulRaftHeartbeatTimeout
 	base.RaftConfig.LeaderLeaseTimeout = a.config.ConsulRaftLeaderLeaseTimeout
@@ -944,6 +1096,9 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 	if a.config.Bootstrap {
 		base.Bootstrap = true
 	}
+	if a.config.CheckOutputMaxSize > 0 {
+		base.CheckOutputMaxSize = a.config.CheckOutputMaxSize
+	}
 	if a.config.RejoinAfterLeave {
 		base.RejoinAfterLeave = true
 	}
@@ -962,6 +1117,9 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 	if a.config.RaftSnapshotInterval != 0 {
 		base.RaftConfig.SnapshotInterval = a.config.RaftSnapshotInterval
 	}
+	if a.config.RaftTrailingLogs != 0 {
+		base.RaftConfig.TrailingLogs = uint64(a.config.RaftTrailingLogs)
+	}
 	if a.config.ACLMasterToken != "" {
 		base.ACLMasterToken = a.config.ACLMasterToken
 	}
@@ -973,6 +1131,9 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 	}
 	if a.config.ACLPolicyTTL != 0 {
 		base.ACLPolicyTTL = a.config.ACLPolicyTTL
+	}
+	if a.config.ACLRoleTTL != 0 {
+		base.ACLRoleTTL = a.config.ACLRoleTTL
 	}
 	if a.config.ACLDefaultPolicy != "" {
 		base.ACLDefaultPolicy = a.config.ACLDefaultPolicy
@@ -1054,10 +1215,11 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 	base.TLSCipherSuites = a.config.TLSCipherSuites
 	base.TLSPreferServerCipherSuites = a.config.TLSPreferServerCipherSuites
 
+	base.AutoEncryptAllowTLS = a.config.AutoEncryptAllowTLS
+
 	// Copy the Connect CA bootstrap config
 	if a.config.ConnectEnabled {
 		base.ConnectEnabled = true
-		base.ConnectReplicationToken = a.config.ConnectReplicationToken
 
 		// Allow config to specify cluster_id provided it's a valid UUID. This is
 		// meant only for tests where a deterministic ID makes fixtures much simpler
@@ -1084,15 +1246,12 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 
 		if a.config.ConnectCAProvider != "" {
 			base.CAConfig.Provider = a.config.ConnectCAProvider
+		}
 
-			// Merge with the default config if it's the consul provider.
-			if a.config.ConnectCAProvider == "consul" {
-				for k, v := range a.config.ConnectCAConfig {
-					base.CAConfig.Config[k] = v
-				}
-			} else {
-				base.CAConfig.Config = a.config.ConnectCAConfig
-			}
+		// Merge connect CA Config regardless of provider (since there are some
+		// common config options valid to all like leaf TTL).
+		for k, v := range a.config.ConnectCAConfig {
+			base.CAConfig.Config[k] = v
 		}
 	}
 
@@ -1105,6 +1264,7 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 	}
 
 	// Setup the loggers
+	base.LogLevel = a.config.LogLevel
 	base.LogOutput = a.LogOutput
 
 	// This will set up the LAN keyring, as well as the WAN and any segments
@@ -1112,6 +1272,8 @@ func (a *Agent) consulConfig() (*consul.Config, error) {
 	if err := a.setupKeyrings(base); err != nil {
 		return nil, fmt.Errorf("Failed to configure keyring: %v", err)
 	}
+
+	base.ConfigEntryBootstrap = a.config.ConfigEntryBootstrap
 
 	return base, nil
 }
@@ -1421,8 +1583,8 @@ func (a *Agent) ShutdownAgent() error {
 	a.logger.Println("[INFO] agent: Requesting shutdown")
 
 	// Stop all the checks
-	a.checkLock.Lock()
-	defer a.checkLock.Unlock()
+	a.stateLock.Lock()
+	defer a.stateLock.Unlock()
 	for _, chk := range a.checkMonitors {
 		chk.Stop()
 	}
@@ -1453,24 +1615,6 @@ func (a *Agent) ShutdownAgent() error {
 	// Stop the proxy config manager
 	if a.proxyConfig != nil {
 		a.proxyConfig.Close()
-	}
-
-	// Stop the proxy process manager
-	if a.proxyManager != nil {
-		// If persistence is disabled (implies DevMode but a subset of DevMode) then
-		// don't leave the proxies running since the agent will not be able to
-		// recover them later.
-		if a.config.DataDir == "" {
-			a.logger.Printf("[WARN] agent: dev mode disabled persistence, killing " +
-				"all proxies since we can't recover them")
-			if err := a.proxyManager.Kill(); err != nil {
-				a.logger.Printf("[WARN] agent: error shutting down proxy manager: %s", err)
-			}
-		} else {
-			if err := a.proxyManager.Close(); err != nil {
-				a.logger.Printf("[WARN] agent: error shutting down proxy manager: %s", err)
-			}
-		}
 	}
 
 	// Stop the cache background work
@@ -1553,11 +1697,15 @@ func (a *Agent) ShutdownCh() <-chan struct{} {
 func (a *Agent) JoinLAN(addrs []string) (n int, err error) {
 	a.logger.Printf("[INFO] agent: (LAN) joining: %v", addrs)
 	n, err = a.delegate.JoinLAN(addrs)
-	a.logger.Printf("[INFO] agent: (LAN) joined: %d Err: %v", n, err)
-	if err == nil && a.joinLANNotifier != nil {
-		if notifErr := a.joinLANNotifier.Notify(systemd.Ready); notifErr != nil {
-			a.logger.Printf("[DEBUG] agent: systemd notify failed: %v", notifErr)
+	if err == nil {
+		a.logger.Printf("[INFO] agent: (LAN) joined: %d", n)
+		if a.joinLANNotifier != nil {
+			if notifErr := a.joinLANNotifier.Notify(systemd.Ready); notifErr != nil {
+				a.logger.Printf("[DEBUG] agent: systemd notify failed: %v", notifErr)
+			}
 		}
+	} else {
+		a.logger.Printf("[WARN] agent: (LAN) couldn't join: %d Err: %v", n, err)
 	}
 	return
 }
@@ -1570,7 +1718,11 @@ func (a *Agent) JoinWAN(addrs []string) (n int, err error) {
 	} else {
 		err = fmt.Errorf("Must be a server to join WAN cluster")
 	}
-	a.logger.Printf("[INFO] agent: (WAN) joined: %d Err: %v", n, err)
+	if err == nil {
+		a.logger.Printf("[INFO] agent: (WAN) joined: %d", n)
+	} else {
+		a.logger.Printf("[WARN] agent: (WAN) couldn't join: %d Err: %v", n, err)
+	}
 	return
 }
 
@@ -1736,17 +1888,21 @@ func (a *Agent) reapServicesInternal() {
 
 		// See if there's a timeout.
 		// todo(fs): this looks fishy... why is there another data structure in the agent with its own lock?
-		a.checkLock.Lock()
+		a.stateLock.Lock()
 		timeout := a.checkReapAfter[checkID]
-		a.checkLock.Unlock()
+		a.stateLock.Unlock()
 
 		// Reap, if necessary. We keep track of which service
 		// this is so that we won't try to remove it again.
 		if timeout > 0 && cs.CriticalFor() > timeout {
 			reaped[serviceID] = true
-			a.RemoveService(serviceID, true)
-			a.logger.Printf("[INFO] agent: Check %q for service %q has been critical for too long; deregistered service",
-				checkID, serviceID)
+			if err := a.RemoveService(serviceID, true); err != nil {
+				a.logger.Printf("[ERR] agent: unable to deregister service %q after check %q has been critical for too long: %s",
+					serviceID, checkID, err)
+			} else {
+				a.logger.Printf("[INFO] agent: Check %q for service %q has been critical for too long; deregistered service",
+					checkID, serviceID)
+			}
 		}
 	}
 }
@@ -1798,44 +1954,6 @@ func (a *Agent) purgeService(serviceID string) error {
 	return nil
 }
 
-// persistedProxy is used to wrap a proxy definition and bundle it with an Proxy
-// token so we can continue to authenticate the running proxy after a restart.
-type persistedProxy struct {
-	ProxyToken string
-	Proxy      *structs.ConnectManagedProxy
-
-	// Set to true when the proxy information originated from the agents configuration
-	// as opposed to API registration.
-	FromFile bool
-}
-
-// persistProxy saves a proxy definition to a JSON file in the data dir
-func (a *Agent) persistProxy(proxy *local.ManagedProxy, FromFile bool) error {
-	proxyPath := filepath.Join(a.config.DataDir, proxyDir,
-		stringHash(proxy.Proxy.ProxyService.ID))
-
-	wrapped := persistedProxy{
-		ProxyToken: proxy.ProxyToken,
-		Proxy:      proxy.Proxy,
-		FromFile:   FromFile,
-	}
-	encoded, err := json.Marshal(wrapped)
-	if err != nil {
-		return err
-	}
-
-	return file.WriteAtomic(proxyPath, encoded)
-}
-
-// purgeProxy removes a persisted proxy definition file from the data dir
-func (a *Agent) purgeProxy(proxyID string) error {
-	proxyPath := filepath.Join(a.config.DataDir, proxyDir, stringHash(proxyID))
-	if _, err := os.Stat(proxyPath); err == nil {
-		return os.Remove(proxyPath)
-	}
-	return nil
-}
-
 // persistCheck saves a check definition to the local agent's state directory
 func (a *Agent) persistCheck(check *structs.HealthCheck, chkType *structs.CheckType) error {
 	checkPath := filepath.Join(a.config.DataDir, checksDir, checkIDHash(check.CheckID))
@@ -1868,6 +1986,126 @@ func (a *Agent) purgeCheck(checkID types.CheckID) error {
 // This entry is persistent and the agent will make a best effort to
 // ensure it is registered
 func (a *Agent) AddService(service *structs.NodeService, chkTypes []*structs.CheckType, persist bool, token string, source configSource) error {
+	a.stateLock.Lock()
+	defer a.stateLock.Unlock()
+	return a.addServiceLocked(service, chkTypes, persist, token, source)
+}
+
+// addServiceLocked adds a service entry to the service manager if enabled, or directly
+// to the local state if it is not. This function assumes the state lock is already held.
+func (a *Agent) addServiceLocked(service *structs.NodeService, chkTypes []*structs.CheckType, persist bool, token string, source configSource) error {
+	if err := a.validateService(service, chkTypes); err != nil {
+		return err
+	}
+
+	if a.config.EnableCentralServiceConfig {
+		return a.serviceManager.AddService(service, chkTypes, persist, token, source)
+	}
+
+	return a.addServiceInternal(service, chkTypes, persist, token, source)
+}
+
+// addServiceInternal adds the given service and checks to the local state.
+func (a *Agent) addServiceInternal(service *structs.NodeService, chkTypes []*structs.CheckType, persist bool, token string, source configSource) error {
+	// Pause the service syncs during modification
+	a.PauseSync()
+	defer a.ResumeSync()
+
+	// Take a snapshot of the current state of checks (if any), and when adding
+	// a check that already existed carry over the state before resuming
+	// anti-entropy.
+	snap := a.snapshotCheckState()
+
+	var checks []*structs.HealthCheck
+
+	// Create an associated health check
+	for i, chkType := range chkTypes {
+		checkID := string(chkType.CheckID)
+		if checkID == "" {
+			checkID = fmt.Sprintf("service:%s", service.ID)
+			if len(chkTypes) > 1 {
+				checkID += fmt.Sprintf(":%d", i+1)
+			}
+		}
+		name := chkType.Name
+		if name == "" {
+			name = fmt.Sprintf("Service '%s' check", service.Service)
+		}
+		check := &structs.HealthCheck{
+			Node:        a.config.NodeName,
+			CheckID:     types.CheckID(checkID),
+			Name:        name,
+			Status:      api.HealthCritical,
+			Notes:       chkType.Notes,
+			ServiceID:   service.ID,
+			ServiceName: service.Service,
+			ServiceTags: service.Tags,
+		}
+		if chkType.Status != "" {
+			check.Status = chkType.Status
+		}
+
+		// Restore the fields from the snapshot.
+		prev, ok := snap[check.CheckID]
+		if ok {
+			check.Output = prev.Output
+			check.Status = prev.Status
+		}
+
+		checks = append(checks, check)
+	}
+
+	// cleanup, store the ids of services and checks that weren't previously
+	// registered so we clean them up if somthing fails halfway through the
+	// process.
+	var cleanupServices []string
+	var cleanupChecks []types.CheckID
+
+	if s := a.State.Service(service.ID); s == nil {
+		cleanupServices = append(cleanupServices, service.ID)
+	}
+
+	for _, check := range checks {
+		if c := a.State.Check(check.CheckID); c == nil {
+			cleanupChecks = append(cleanupChecks, check.CheckID)
+		}
+	}
+
+	err := a.State.AddServiceWithChecks(service, checks, token)
+	if err != nil {
+		a.cleanupRegistration(cleanupServices, cleanupChecks)
+		return err
+	}
+
+	for i := range checks {
+		if err := a.addCheck(checks[i], chkTypes[i], service, persist, token, source); err != nil {
+			a.cleanupRegistration(cleanupServices, cleanupChecks)
+			return err
+		}
+
+		if persist && a.config.DataDir != "" {
+			if err := a.persistCheck(checks[i], chkTypes[i]); err != nil {
+				a.cleanupRegistration(cleanupServices, cleanupChecks)
+				return err
+
+			}
+		}
+	}
+
+	// Persist the service to a file
+	if persist && a.config.DataDir != "" {
+		if err := a.persistService(service); err != nil {
+			a.cleanupRegistration(cleanupServices, cleanupChecks)
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateService validates an service and its checks, either returning an error or emitting a
+// warning based on the nature of the error.
+func (a *Agent) validateService(service *structs.NodeService, chkTypes []*structs.CheckType) error {
 	if service.Service == "" {
 		return fmt.Errorf("Service name missing")
 	}
@@ -1910,64 +2148,64 @@ func (a *Agent) AddService(service *structs.NodeService, chkTypes []*structs.Che
 		}
 	}
 
-	// Pause the service syncs during modification
-	a.PauseSync()
-	defer a.ResumeSync()
-
-	// Add the service
-	a.State.AddService(service, token)
-
-	// Persist the service to a file
-	if persist && a.config.DataDir != "" {
-		if err := a.persistService(service); err != nil {
-			return err
-		}
-	}
-
-	// Create an associated health check
-	for i, chkType := range chkTypes {
-		checkID := string(chkType.CheckID)
-		if checkID == "" {
-			checkID = fmt.Sprintf("service:%s", service.ID)
-			if len(chkTypes) > 1 {
-				checkID += fmt.Sprintf(":%d", i+1)
-			}
-		}
-		name := chkType.Name
-		if name == "" {
-			name = fmt.Sprintf("Service '%s' check", service.Service)
-		}
-		check := &structs.HealthCheck{
-			Node:        a.config.NodeName,
-			CheckID:     types.CheckID(checkID),
-			Name:        name,
-			Status:      api.HealthCritical,
-			Notes:       chkType.Notes,
-			ServiceID:   service.ID,
-			ServiceName: service.Service,
-			ServiceTags: service.Tags,
-		}
-		if chkType.Status != "" {
-			check.Status = chkType.Status
-		}
-		if err := a.AddCheck(check, chkType, persist, token, source); err != nil {
-			return err
-		}
-	}
-
 	return nil
+}
+
+// cleanupRegistration is called on  registration error to ensure no there are no
+// leftovers after a partial failure
+func (a *Agent) cleanupRegistration(serviceIDs []string, checksIDs []types.CheckID) {
+	for _, s := range serviceIDs {
+		if err := a.State.RemoveService(s); err != nil {
+			a.logger.Printf("[ERR] consul: service registration: cleanup: failed to remove service %s: %s", s, err)
+		}
+		if err := a.purgeService(s); err != nil {
+			a.logger.Printf("[ERR] consul: service registration: cleanup: failed to purge service %s file: %s", s, err)
+		}
+	}
+
+	for _, c := range checksIDs {
+		a.cancelCheckMonitors(c)
+		if err := a.State.RemoveCheck(c); err != nil {
+			a.logger.Printf("[ERR] consul: service registration: cleanup: failed to remove check %s: %s", c, err)
+		}
+		if err := a.purgeCheck(c); err != nil {
+			a.logger.Printf("[ERR] consul: service registration: cleanup: failed to purge check %s file: %s", c, err)
+		}
+	}
 }
 
 // RemoveService is used to remove a service entry.
 // The agent will make a best effort to ensure it is deregistered
 func (a *Agent) RemoveService(serviceID string, persist bool) error {
+	a.stateLock.Lock()
+	defer a.stateLock.Unlock()
+	return a.removeServiceLocked(serviceID, persist)
+}
+
+// removeServiceLocked is used to remove a service entry.
+// The agent will make a best effort to ensure it is deregistered
+func (a *Agent) removeServiceLocked(serviceID string, persist bool) error {
 	// Validate ServiceID
 	if serviceID == "" {
 		return fmt.Errorf("ServiceID missing")
 	}
 
+	// Shut down the config watch in the service manager if enabled.
+	if a.config.EnableCentralServiceConfig {
+		a.serviceManager.RemoveService(serviceID)
+	}
+
+	checks := a.State.Checks()
+	var checkIDs []types.CheckID
+	for id, check := range checks {
+		if check.ServiceID != serviceID {
+			continue
+		}
+		checkIDs = append(checkIDs, id)
+	}
+
 	// Remove service immediately
-	if err := a.State.RemoveService(serviceID); err != nil {
+	if err := a.State.RemoveServiceWithChecks(serviceID, checkIDs); err != nil {
 		a.logger.Printf("[WARN] agent: Failed to deregister service %q: %s", serviceID, err)
 		return nil
 	}
@@ -1980,21 +2218,12 @@ func (a *Agent) RemoveService(serviceID string, persist bool) error {
 	}
 
 	// Deregister any associated health checks
-	for checkID, check := range a.State.Checks() {
+	for checkID, check := range checks {
 		if check.ServiceID != serviceID {
 			continue
 		}
-		if err := a.RemoveCheck(checkID, persist); err != nil {
+		if err := a.removeCheckLocked(checkID, persist); err != nil {
 			return err
-		}
-	}
-
-	// Remove the associated managed proxy if it exists
-	for proxyID, p := range a.State.Proxies() {
-		if p.Proxy.TargetServiceID == serviceID {
-			if err := a.RemoveProxy(proxyID, true); err != nil {
-				return err
-			}
 		}
 	}
 
@@ -2006,7 +2235,7 @@ func (a *Agent) RemoveService(serviceID string, persist bool) error {
 		// this from a sidecar.
 		if sidecar.LocallyRegisteredAsSidecar {
 			// Remove it!
-			err := a.RemoveService(a.sidecarServiceID(serviceID), persist)
+			err := a.removeServiceLocked(a.sidecarServiceID(serviceID), persist)
 			if err != nil {
 				return err
 			}
@@ -2021,6 +2250,50 @@ func (a *Agent) RemoveService(serviceID string, persist bool) error {
 // ensure it is registered. The Check may include a CheckType which
 // is used to automatically update the check status
 func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType, persist bool, token string, source configSource) error {
+	a.stateLock.Lock()
+	defer a.stateLock.Unlock()
+	return a.addCheckLocked(check, chkType, persist, token, source)
+}
+
+func (a *Agent) addCheckLocked(check *structs.HealthCheck, chkType *structs.CheckType, persist bool, token string, source configSource) error {
+	var service *structs.NodeService
+
+	if check.ServiceID != "" {
+		service = a.State.Service(check.ServiceID)
+		if service == nil {
+			return fmt.Errorf("ServiceID %q does not exist", check.ServiceID)
+		}
+	}
+
+	// snapshot the current state of the health check to avoid potential flapping
+	existing := a.State.Check(check.CheckID)
+	defer func() {
+		if existing != nil {
+			a.State.UpdateCheck(check.CheckID, existing.Status, existing.Output)
+		}
+	}()
+
+	err := a.addCheck(check, chkType, service, persist, token, source)
+	if err != nil {
+		a.State.RemoveCheck(check.CheckID)
+		return err
+	}
+
+	// Add to the local state for anti-entropy
+	err = a.State.AddCheck(check, token)
+	if err != nil {
+		return err
+	}
+
+	// Persist the check
+	if persist && a.config.DataDir != "" {
+		return a.persistCheck(check, chkType)
+	}
+
+	return nil
+}
+
+func (a *Agent) addCheck(check *structs.HealthCheck, chkType *structs.CheckType, service *structs.NodeService, persist bool, token string, source configSource) error {
 	if check.CheckID == "" {
 		return fmt.Errorf("CheckID missing")
 	}
@@ -2042,27 +2315,19 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 	}
 
 	if check.ServiceID != "" {
-		s := a.State.Service(check.ServiceID)
-		if s == nil {
-			return fmt.Errorf("ServiceID %q does not exist", check.ServiceID)
-		}
-		check.ServiceName = s.Service
-		check.ServiceTags = s.Tags
+		check.ServiceName = service.Service
+		check.ServiceTags = service.Tags
 	}
-
-	a.checkLock.Lock()
-	defer a.checkLock.Unlock()
-
-	// snapshot the current state of the health check to avoid potential flapping
-	existing := a.State.Check(check.CheckID)
-	defer func() {
-		if existing != nil {
-			a.State.UpdateCheck(check.CheckID, existing.Status, existing.Output)
-		}
-	}()
 
 	// Check if already registered
 	if chkType != nil {
+		maxOutputSize := a.config.CheckOutputMaxSize
+		if maxOutputSize == 0 {
+			maxOutputSize = checks.DefaultBufSize
+		}
+		if chkType.OutputMaxSize > 0 && maxOutputSize > chkType.OutputMaxSize {
+			maxOutputSize = chkType.OutputMaxSize
+		}
 		switch {
 
 		case chkType.IsTTL():
@@ -2072,10 +2337,11 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 			}
 
 			ttl := &checks.CheckTTL{
-				Notify:  a.State,
-				CheckID: check.CheckID,
-				TTL:     chkType.TTL,
-				Logger:  a.logger,
+				Notify:        a.State,
+				CheckID:       check.CheckID,
+				TTL:           chkType.TTL,
+				Logger:        a.logger,
+				OutputMaxSize: maxOutputSize,
 			}
 
 			// Restore persisted state, if any
@@ -2098,10 +2364,7 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 				chkType.Interval = checks.MinInterval
 			}
 
-			tlsClientConfig, err := a.setupTLSClientConfig(chkType.TLSSkipVerify)
-			if err != nil {
-				return fmt.Errorf("Failed to set up TLS: %v", err)
-			}
+			tlsClientConfig := a.tlsConfigurator.OutgoingTLSConfigForCheck(chkType.TLSSkipVerify)
 
 			http := &checks.CheckHTTP{
 				Notify:          a.State,
@@ -2112,6 +2375,7 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 				Interval:        chkType.Interval,
 				Timeout:         chkType.Timeout,
 				Logger:          a.logger,
+				OutputMaxSize:   maxOutputSize,
 				TLSClientConfig: tlsClientConfig,
 			}
 			http.Start()
@@ -2152,11 +2416,7 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 
 			var tlsClientConfig *tls.Config
 			if chkType.GRPCUseTLS {
-				var err error
-				tlsClientConfig, err = a.setupTLSClientConfig(chkType.TLSSkipVerify)
-				if err != nil {
-					return fmt.Errorf("Failed to set up TLS: %v", err)
-				}
+				tlsClientConfig = a.tlsConfigurator.OutgoingTLSConfigForCheck(chkType.TLSSkipVerify)
 			}
 
 			grpc := &checks.CheckGRPC{
@@ -2183,7 +2443,7 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 			}
 
 			if a.dockerClient == nil {
-				dc, err := checks.NewDockerClient(os.Getenv("DOCKER_HOST"), checks.BufSize)
+				dc, err := checks.NewDockerClient(os.Getenv("DOCKER_HOST"), int64(maxOutputSize))
 				if err != nil {
 					a.logger.Printf("[ERR] agent: error creating docker client: %s", err)
 					return err
@@ -2218,14 +2478,14 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 					check.CheckID, checks.MinInterval)
 				chkType.Interval = checks.MinInterval
 			}
-
 			monitor := &checks.CheckMonitor{
-				Notify:     a.State,
-				CheckID:    check.CheckID,
-				ScriptArgs: chkType.ScriptArgs,
-				Interval:   chkType.Interval,
-				Timeout:    chkType.Timeout,
-				Logger:     a.logger,
+				Notify:        a.State,
+				CheckID:       check.CheckID,
+				ScriptArgs:    chkType.ScriptArgs,
+				Interval:      chkType.Interval,
+				Timeout:       chkType.Timeout,
+				Logger:        a.logger,
+				OutputMaxSize: maxOutputSize,
 			}
 			monitor.Start()
 			a.checkMonitors[check.CheckID] = monitor
@@ -2276,53 +2536,27 @@ func (a *Agent) AddCheck(check *structs.HealthCheck, chkType *structs.CheckType,
 		}
 	}
 
-	// Add to the local state for anti-entropy
-	err := a.State.AddCheck(check, token)
-	if err != nil {
-		a.cancelCheckMonitors(check.CheckID)
-		return err
-	}
-
-	// Persist the check
-	if persist && a.config.DataDir != "" {
-		return a.persistCheck(check, chkType)
-	}
-
 	return nil
-}
-
-func (a *Agent) setupTLSClientConfig(skipVerify bool) (tlsClientConfig *tls.Config, err error) {
-	// We re-use the API client's TLS structure since it
-	// closely aligns with Consul's internal configuration.
-	tlsConfig := &api.TLSConfig{
-		InsecureSkipVerify: skipVerify,
-	}
-	if a.config.EnableAgentTLSForChecks {
-		tlsConfig.Address = a.config.ServerName
-		tlsConfig.KeyFile = a.config.KeyFile
-		tlsConfig.CertFile = a.config.CertFile
-		tlsConfig.CAFile = a.config.CAFile
-		tlsConfig.CAPath = a.config.CAPath
-	}
-	tlsClientConfig, err = api.SetupTLSConfig(tlsConfig)
-	return
 }
 
 // RemoveCheck is used to remove a health check.
 // The agent will make a best effort to ensure it is deregistered
 func (a *Agent) RemoveCheck(checkID types.CheckID, persist bool) error {
+	a.stateLock.Lock()
+	defer a.stateLock.Unlock()
+	return a.removeCheckLocked(checkID, persist)
+}
+
+// removeCheckLocked is used to remove a health check.
+// The agent will make a best effort to ensure it is deregistered
+func (a *Agent) removeCheckLocked(checkID types.CheckID, persist bool) error {
 	// Validate CheckID
 	if checkID == "" {
 		return fmt.Errorf("CheckID missing")
 	}
 
-	// Add to the local state for anti-entropy
-	a.State.RemoveCheck(checkID)
-
-	a.checkLock.Lock()
-	defer a.checkLock.Unlock()
-
 	a.cancelCheckMonitors(checkID)
+	a.State.RemoveCheck(checkID)
 
 	if persist {
 		if err := a.purgeCheck(checkID); err != nil {
@@ -2334,102 +2568,6 @@ func (a *Agent) RemoveCheck(checkID types.CheckID, persist bool) error {
 	}
 	a.logger.Printf("[DEBUG] agent: removed check %q", checkID)
 	return nil
-}
-
-// addProxyLocked adds a new local Connect Proxy instance to be managed by the agent.
-//
-// This assumes that the agent's proxyLock is already held
-//
-// It REQUIRES that the service that is being proxied is already present in the
-// local state. Note that this is only used for agent-managed proxies so we can
-// ensure that we always make this true. For externally managed and registered
-// proxies we explicitly allow the proxy to be registered first to make
-// bootstrap ordering of a new service simpler but the same is not true here
-// since this is only ever called when setting up a _managed_ proxy which was
-// registered as part of a service registration either from config or HTTP API
-// call.
-//
-// The restoredProxyToken argument should only be used when restoring proxy
-// definitions from disk; new proxies must leave it blank to get a new token
-// assigned. We need to restore from disk to enable to continue authenticating
-// running proxies that already had that credential injected.
-func (a *Agent) addProxyLocked(proxy *structs.ConnectManagedProxy, persist, FromFile bool,
-	restoredProxyToken string, source configSource) error {
-	// Lookup the target service token in state if there is one.
-	token := a.State.ServiceToken(proxy.TargetServiceID)
-
-	// Copy the basic proxy structure so it isn't modified w/ defaults
-	proxyCopy := *proxy
-	proxy = &proxyCopy
-	if err := a.applyProxyDefaults(proxy); err != nil {
-		return err
-	}
-
-	// Add the proxy to local state first since we may need to assign a port which
-	// needs to be coordinate under state lock. AddProxy will generate the
-	// NodeService for the proxy populated with the allocated (or configured) port
-	// and an ID, but it doesn't add it to the agent directly since that could
-	// deadlock and we may need to coordinate adding it and persisting etc.
-	proxyState, err := a.State.AddProxy(proxy, token, restoredProxyToken)
-	if err != nil {
-		return err
-	}
-	proxyService := proxyState.Proxy.ProxyService
-
-	// Register proxy TCP check. The built in proxy doesn't listen publically
-	// until it's loaded certs so this ensures we won't route traffic until it's
-	// ready.
-	proxyCfg, err := a.applyProxyConfigDefaults(proxyState.Proxy)
-	if err != nil {
-		return err
-	}
-	chkAddr := a.resolveProxyCheckAddress(proxyCfg)
-	chkTypes := []*structs.CheckType{}
-	if chkAddr != "" {
-		chkTypes = []*structs.CheckType{
-			&structs.CheckType{
-				Name: "Connect Proxy Listening",
-				TCP: fmt.Sprintf("%s:%d", chkAddr,
-					proxyCfg["bind_port"]),
-				Interval: 10 * time.Second,
-			},
-		}
-	}
-
-	err = a.AddService(proxyService, chkTypes, persist, token, source)
-	if err != nil {
-		// Remove the state too
-		a.State.RemoveProxy(proxyService.ID)
-		return err
-	}
-
-	// Persist the proxy
-	if persist && a.config.DataDir != "" {
-		return a.persistProxy(proxyState, FromFile)
-	}
-	return nil
-}
-
-// AddProxy adds a new local Connect Proxy instance to be managed by the agent.
-//
-// It REQUIRES that the service that is being proxied is already present in the
-// local state. Note that this is only used for agent-managed proxies so we can
-// ensure that we always make this true. For externally managed and registered
-// proxies we explicitly allow the proxy to be registered first to make
-// bootstrap ordering of a new service simpler but the same is not true here
-// since this is only ever called when setting up a _managed_ proxy which was
-// registered as part of a service registration either from config or HTTP API
-// call.
-//
-// The restoredProxyToken argument should only be used when restoring proxy
-// definitions from disk; new proxies must leave it blank to get a new token
-// assigned. We need to restore from disk to enable to continue authenticating
-// running proxies that already had that credential injected.
-func (a *Agent) AddProxy(proxy *structs.ConnectManagedProxy, persist, FromFile bool,
-	restoredProxyToken string, source configSource) error {
-	a.proxyLock.Lock()
-	defer a.proxyLock.Unlock()
-	return a.addProxyLocked(proxy, persist, FromFile, restoredProxyToken, source)
 }
 
 // resolveProxyCheckAddress returns the best address to use for a TCP check of
@@ -2470,218 +2608,6 @@ func (a *Agent) resolveProxyCheckAddress(proxyCfg map[string]interface{}) string
 	return "127.0.0.1"
 }
 
-// applyProxyConfigDefaults takes a *structs.ConnectManagedProxy and returns
-// it's Config map merged with any defaults from the Agent's config. It would be
-// nicer if this were defined as a method on structs.ConnectManagedProxy but we
-// can't do that because ot the import cycle it causes with agent/config.
-func (a *Agent) applyProxyConfigDefaults(p *structs.ConnectManagedProxy) (map[string]interface{}, error) {
-	if p == nil || p.ProxyService == nil {
-		// Should never happen but protect from panic
-		return nil, fmt.Errorf("invalid proxy state")
-	}
-
-	// Lookup the target service
-	target := a.State.Service(p.TargetServiceID)
-	if target == nil {
-		// Can happen during deregistration race between proxy and scheduler.
-		return nil, fmt.Errorf("unknown target service ID: %s", p.TargetServiceID)
-	}
-
-	// Merge globals defaults
-	config := make(map[string]interface{})
-	for k, v := range a.config.ConnectProxyDefaultConfig {
-		if _, ok := config[k]; !ok {
-			config[k] = v
-		}
-	}
-
-	// Copy config from the proxy
-	for k, v := range p.Config {
-		config[k] = v
-	}
-
-	// Set defaults for anything that is still not specified but required.
-	// Note that these are not included in the content hash. Since we expect
-	// them to be static in general but some like the default target service
-	// port might not be. In that edge case services can set that explicitly
-	// when they re-register which will be caught though.
-	if _, ok := config["bind_port"]; !ok {
-		config["bind_port"] = p.ProxyService.Port
-	}
-	if _, ok := config["bind_address"]; !ok {
-		// Default to binding to the same address the agent is configured to
-		// bind to.
-		config["bind_address"] = a.config.BindAddr.String()
-	}
-	if _, ok := config["local_service_address"]; !ok {
-		// Default to localhost and the port the service registered with
-		config["local_service_address"] = fmt.Sprintf("127.0.0.1:%d", target.Port)
-	}
-
-	// Basic type conversions for expected types.
-	if raw, ok := config["bind_port"]; ok {
-		switch v := raw.(type) {
-		case float64:
-			// Common since HCL/JSON parse as float64
-			config["bind_port"] = int(v)
-
-			// NOTE(mitchellh): No default case since errors and validation
-			// are handled by the ServiceDefinition.Validate function.
-		}
-	}
-
-	return config, nil
-}
-
-// applyProxyDefaults modifies the given proxy by applying any configured
-// defaults, such as the default execution mode, command, etc.
-func (a *Agent) applyProxyDefaults(proxy *structs.ConnectManagedProxy) error {
-	// Set the default exec mode
-	if proxy.ExecMode == structs.ProxyExecModeUnspecified {
-		mode, err := structs.NewProxyExecMode(a.config.ConnectProxyDefaultExecMode)
-		if err != nil {
-			return err
-		}
-
-		proxy.ExecMode = mode
-	}
-	if proxy.ExecMode == structs.ProxyExecModeUnspecified {
-		proxy.ExecMode = structs.ProxyExecModeDaemon
-	}
-
-	// Set the default command to the globally configured default
-	if len(proxy.Command) == 0 {
-		switch proxy.ExecMode {
-		case structs.ProxyExecModeDaemon:
-			proxy.Command = a.config.ConnectProxyDefaultDaemonCommand
-
-		case structs.ProxyExecModeScript:
-			proxy.Command = a.config.ConnectProxyDefaultScriptCommand
-		}
-	}
-
-	// If there is no globally configured default we need to get the
-	// default command so we can do "consul connect proxy"
-	if len(proxy.Command) == 0 {
-		command, err := defaultProxyCommand(a.config)
-		if err != nil {
-			return err
-		}
-
-		proxy.Command = command
-	}
-
-	return nil
-}
-
-// removeProxyLocked stops and removes a local proxy instance.
-//
-// It is assumed that this function is called while holding the proxyLock already
-func (a *Agent) removeProxyLocked(proxyID string, persist bool) error {
-	// Validate proxyID
-	if proxyID == "" {
-		return fmt.Errorf("proxyID missing")
-	}
-
-	// Remove the proxy from the local state
-	p, err := a.State.RemoveProxy(proxyID)
-	if err != nil {
-		return err
-	}
-
-	// Remove the proxy service as well. The proxy ID is also the ID
-	// of the servie, but we might as well use the service pointer.
-	if err := a.RemoveService(p.Proxy.ProxyService.ID, persist); err != nil {
-		return err
-	}
-
-	if persist && a.config.DataDir != "" {
-		return a.purgeProxy(proxyID)
-	}
-
-	return nil
-}
-
-// RemoveProxy stops and removes a local proxy instance.
-func (a *Agent) RemoveProxy(proxyID string, persist bool) error {
-	a.proxyLock.Lock()
-	defer a.proxyLock.Unlock()
-	return a.removeProxyLocked(proxyID, persist)
-}
-
-// verifyProxyToken takes a token and attempts to verify it against the
-// targetService name. If targetProxy is specified, then the local proxy token
-// must exactly match the given proxy ID. cert, config, etc.).
-//
-// The given token may be a local-only proxy token or it may be an ACL token. We
-// will attempt to verify the local proxy token first.
-//
-// The effective ACL token is returned along with a boolean which is true if the
-// match was against a proxy token rather than an ACL token, and any error. In
-// the case the token matches a proxy token, then the ACL token used to register
-// that proxy's target service is returned for use in any RPC calls the proxy
-// needs to make on behalf of that service. If the token was an ACL token
-// already then it is always returned. Provided error is nil, a valid ACL token
-// is always returned.
-func (a *Agent) verifyProxyToken(token, targetService,
-	targetProxy string) (string, bool, error) {
-	// If we specify a target proxy, we look up that proxy directly. Otherwise,
-	// we resolve with any proxy we can find.
-	var proxy *local.ManagedProxy
-	if targetProxy != "" {
-		proxy = a.State.Proxy(targetProxy)
-		if proxy == nil {
-			return "", false, fmt.Errorf("unknown proxy service ID: %q", targetProxy)
-		}
-
-		// If the token DOESN'T match, then we reset the proxy which will
-		// cause the logic below to fall back to normal ACLs. Otherwise,
-		// we keep the proxy set because we also have to verify that the
-		// target service matches on the proxy.
-		if token != proxy.ProxyToken {
-			proxy = nil
-		}
-	} else {
-		proxy = a.resolveProxyToken(token)
-	}
-
-	// The existence of a token isn't enough, we also need to verify
-	// that the service name of the matching proxy matches our target
-	// service.
-	if proxy != nil {
-		// Get the target service since we only have the name. The nil
-		// check below should never be true since a proxy token always
-		// represents the existence of a local service.
-		target := a.State.Service(proxy.Proxy.TargetServiceID)
-		if target == nil {
-			return "", false, fmt.Errorf("proxy target service not found: %q",
-				proxy.Proxy.TargetServiceID)
-		}
-
-		if target.Service != targetService {
-			return "", false, acl.ErrPermissionDenied
-		}
-
-		// Resolve the actual ACL token used to register the proxy/service and
-		// return that for use in RPC calls.
-		return a.State.ServiceToken(proxy.Proxy.TargetServiceID), true, nil
-	}
-
-	// Doesn't match, we have to do a full token resolution. The required
-	// permission for any proxy-related endpoint is service:write, since
-	// to register a proxy you require that permission and sensitive data
-	// is usually present in the configuration.
-	rule, err := a.resolveToken(token)
-	if err != nil {
-		return "", false, err
-	}
-	if rule != nil && !rule.ServiceWrite(targetService, nil) {
-		return "", false, acl.ErrPermissionDenied
-	}
-
-	return token, false, nil
-}
-
 func (a *Agent) cancelCheckMonitors(checkID types.CheckID) {
 	// Stop any monitors
 	delete(a.checkReapAfter, checkID)
@@ -2713,8 +2639,8 @@ func (a *Agent) cancelCheckMonitors(checkID types.CheckID) {
 
 // updateTTLCheck is used to update the status of a TTL check via the Agent API.
 func (a *Agent) updateTTLCheck(checkID types.CheckID, status, output string) error {
-	a.checkLock.Lock()
-	defer a.checkLock.Unlock()
+	a.stateLock.Lock()
+	defer a.stateLock.Unlock()
 
 	// Grab the TTL check.
 	check, ok := a.checkTTLs[checkID]
@@ -2723,7 +2649,7 @@ func (a *Agent) updateTTLCheck(checkID types.CheckID, status, output string) err
 	}
 
 	// Set the status through CheckTTL to reset the TTL.
-	check.SetStatus(status, output)
+	outputTruncated := check.SetStatus(status, output)
 
 	// We don't write any files in dev mode so bail here.
 	if a.config.DataDir == "" {
@@ -2732,7 +2658,7 @@ func (a *Agent) updateTTLCheck(checkID types.CheckID, status, output string) err
 
 	// Persist the state so the TTL check can come up in a good state after
 	// an agent restart, especially with long TTL values.
-	if err := a.persistCheckState(check, status, output); err != nil {
+	if err := a.persistCheckState(check, status, outputTruncated); err != nil {
 		return fmt.Errorf("failed persisting state for check %q: %s", checkID, err)
 	}
 
@@ -2917,13 +2843,13 @@ func (a *Agent) loadServices(conf *config.RuntimeConfig) error {
 		// syntax sugar and shouldn't be persisted in local or server state.
 		ns.Connect.SidecarService = nil
 
-		if err := a.AddService(ns, chkTypes, false, service.Token, ConfigSourceLocal); err != nil {
+		if err := a.addServiceLocked(ns, chkTypes, false, service.Token, ConfigSourceLocal); err != nil {
 			return fmt.Errorf("Failed to register service %q: %v", service.Name, err)
 		}
 
 		// If there is a sidecar service, register that too.
 		if sidecar != nil {
-			if err := a.AddService(sidecar, sidecarChecks, false, sidecarToken, ConfigSourceLocal); err != nil {
+			if err := a.addServiceLocked(sidecar, sidecarChecks, false, sidecarToken, ConfigSourceLocal); err != nil {
 				return fmt.Errorf("Failed to register sidecar for service %q: %v", service.Name, err)
 			}
 		}
@@ -2986,7 +2912,7 @@ func (a *Agent) loadServices(conf *config.RuntimeConfig) error {
 		} else {
 			a.logger.Printf("[DEBUG] agent: restored service definition %q from %q",
 				serviceID, file)
-			if err := a.AddService(p.Service, nil, false, p.Token, ConfigSourceLocal); err != nil {
+			if err := a.addServiceLocked(p.Service, nil, false, p.Token, ConfigSourceLocal); err != nil {
 				return fmt.Errorf("failed adding service %q: %s", serviceID, err)
 			}
 		}
@@ -2998,7 +2924,7 @@ func (a *Agent) loadServices(conf *config.RuntimeConfig) error {
 // unloadServices will deregister all services.
 func (a *Agent) unloadServices() error {
 	for id := range a.State.Services() {
-		if err := a.RemoveService(id, false); err != nil {
+		if err := a.removeServiceLocked(id, false); err != nil {
 			return fmt.Errorf("Failed deregistering service '%s': %v", id, err)
 		}
 	}
@@ -3007,12 +2933,19 @@ func (a *Agent) unloadServices() error {
 
 // loadChecks loads check definitions and/or persisted check definitions from
 // disk and re-registers them with the local agent.
-func (a *Agent) loadChecks(conf *config.RuntimeConfig) error {
+func (a *Agent) loadChecks(conf *config.RuntimeConfig, snap map[types.CheckID]*structs.HealthCheck) error {
 	// Register the checks from config
 	for _, check := range conf.Checks {
 		health := check.HealthCheck(conf.NodeName)
+
+		// Restore the fields from the snapshot.
+		if prev, ok := snap[health.CheckID]; ok {
+			health.Output = prev.Output
+			health.Status = prev.Status
+		}
+
 		chkType := check.CheckType()
-		if err := a.AddCheck(health, chkType, false, check.Token, ConfigSourceLocal); err != nil {
+		if err := a.addCheckLocked(health, chkType, false, check.Token, ConfigSourceLocal); err != nil {
 			return fmt.Errorf("Failed to register check '%s': %v %v", check.Name, err, check)
 		}
 	}
@@ -3067,7 +3000,13 @@ func (a *Agent) loadChecks(conf *config.RuntimeConfig) error {
 			// services into the active pool
 			p.Check.Status = api.HealthCritical
 
-			if err := a.AddCheck(p.Check, p.ChkType, false, p.Token, ConfigSourceLocal); err != nil {
+			// Restore the fields from the snapshot.
+			if prev, ok := snap[p.Check.CheckID]; ok {
+				p.Check.Output = prev.Output
+				p.Check.Status = prev.Status
+			}
+
+			if err := a.addCheckLocked(p.Check, p.ChkType, false, p.Token, ConfigSourceLocal); err != nil {
 				// Purge the check if it is unable to be restored.
 				a.logger.Printf("[WARN] agent: Failed to restore check %q: %s",
 					checkID, err)
@@ -3086,127 +3025,95 @@ func (a *Agent) loadChecks(conf *config.RuntimeConfig) error {
 // unloadChecks will deregister all checks known to the local agent.
 func (a *Agent) unloadChecks() error {
 	for id := range a.State.Checks() {
-		if err := a.RemoveCheck(id, false); err != nil {
+		if err := a.removeCheckLocked(id, false); err != nil {
 			return fmt.Errorf("Failed deregistering check '%s': %s", id, err)
 		}
 	}
 	return nil
 }
 
-// loadPersistedProxies will load connect proxy definitions from their
-// persisted state on disk and return a slice of them
-//
-// This does not add them to the local
-func (a *Agent) loadPersistedProxies() (map[string]persistedProxy, error) {
-	persistedProxies := make(map[string]persistedProxy)
-
-	proxyDir := filepath.Join(a.config.DataDir, proxyDir)
-	files, err := ioutil.ReadDir(proxyDir)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("Failed reading proxies dir %q: %s", proxyDir, err)
-		}
-	}
-
-	for _, fi := range files {
-		// Skip all dirs
-		if fi.IsDir() {
-			continue
-		}
-
-		// Skip all partially written temporary files
-		if strings.HasSuffix(fi.Name(), "tmp") {
-			return nil, fmt.Errorf("Ignoring temporary proxy file %v", fi.Name())
-		}
-
-		// Open the file for reading
-		file := filepath.Join(proxyDir, fi.Name())
-		fh, err := os.Open(file)
-		if err != nil {
-			return nil, fmt.Errorf("failed opening proxy file %q: %s", file, err)
-		}
-
-		// Read the contents into a buffer
-		buf, err := ioutil.ReadAll(fh)
-		fh.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed reading proxy file %q: %s", file, err)
-		}
-
-		// Try decoding the proxy definition
-		var p persistedProxy
-		if err := json.Unmarshal(buf, &p); err != nil {
-			return nil, fmt.Errorf("Failed decoding proxy file %q: %s", file, err)
-		}
-		svcID := p.Proxy.TargetServiceID
-
-		persistedProxies[svcID] = p
-	}
-
-	return persistedProxies, nil
+type persistedTokens struct {
+	Replication string `json:"replication,omitempty"`
+	AgentMaster string `json:"agent_master,omitempty"`
+	Default     string `json:"default,omitempty"`
+	Agent       string `json:"agent,omitempty"`
 }
 
-// loadProxies will load connect proxy definitions from configuration and
-// persisted definitions on disk, and load them into the local agent.
-func (a *Agent) loadProxies(conf *config.RuntimeConfig) error {
-	a.proxyLock.Lock()
-	defer a.proxyLock.Unlock()
-
-	persistedProxies, persistenceErr := a.loadPersistedProxies()
-
-	for _, svc := range conf.Services {
-		if svc.Connect != nil {
-			proxy, err := svc.ConnectManagedProxy()
-			if err != nil {
-				return fmt.Errorf("failed adding proxy: %s", err)
-			}
-			if proxy == nil {
-				continue
-			}
-			restoredToken := ""
-			if persisted, ok := persistedProxies[proxy.TargetServiceID]; ok {
-				restoredToken = persisted.ProxyToken
-			}
-
-			if err := a.addProxyLocked(proxy, true, true, restoredToken, ConfigSourceLocal); err != nil {
-				return fmt.Errorf("failed adding proxy: %s", err)
-			}
-		}
+func (a *Agent) getPersistedTokens() (*persistedTokens, error) {
+	persistedTokens := &persistedTokens{}
+	if !a.config.ACLEnableTokenPersistence {
+		return persistedTokens, nil
 	}
 
-	for _, persisted := range persistedProxies {
-		proxyID := persisted.Proxy.ProxyService.ID
-		if persisted.FromFile && a.State.Proxy(proxyID) == nil {
-			// Purge proxies that were configured previously but are no longer in the config
-			a.logger.Printf("[DEBUG] agent: purging stale persisted proxy %q", proxyID)
-			if err := a.purgeProxy(proxyID); err != nil {
-				return fmt.Errorf("failed purging proxy %q: %v", proxyID, err)
-			}
-		} else if !persisted.FromFile {
-			if a.State.Proxy(proxyID) == nil {
-				a.logger.Printf("[DEBUG] agent: restored proxy definition %q", proxyID)
-				if err := a.addProxyLocked(persisted.Proxy, false, false, persisted.ProxyToken, ConfigSourceLocal); err != nil {
-					return fmt.Errorf("failed adding proxy %q: %v", proxyID, err)
-				}
-			} else {
-				a.logger.Printf("[WARN] agent: proxy definition %q was overwritten by a proxy definition within a config file", proxyID)
-			}
+	a.persistedTokensLock.RLock()
+	defer a.persistedTokensLock.RUnlock()
+
+	tokensFullPath := filepath.Join(a.config.DataDir, tokensPath)
+
+	buf, err := ioutil.ReadFile(tokensFullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// non-existence is not an error we care about
+			return persistedTokens, nil
 		}
+		return persistedTokens, fmt.Errorf("failed reading tokens file %q: %s", tokensFullPath, err)
+	}
+
+	if err := json.Unmarshal(buf, persistedTokens); err != nil {
+		return persistedTokens, fmt.Errorf("failed to decode tokens file %q: %s", tokensFullPath, err)
+	}
+
+	return persistedTokens, nil
+}
+
+func (a *Agent) loadTokens(conf *config.RuntimeConfig) error {
+	persistedTokens, persistenceErr := a.getPersistedTokens()
+
+	if persistenceErr != nil {
+		a.logger.Printf("[WARN] unable to load persisted tokens: %v", persistenceErr)
+	}
+
+	if persistedTokens.Default != "" {
+		a.tokens.UpdateUserToken(persistedTokens.Default, token.TokenSourceAPI)
+
+		if conf.ACLToken != "" {
+			a.logger.Printf("[WARN] \"default\" token present in both the configuration and persisted token store, using the persisted token")
+		}
+	} else {
+		a.tokens.UpdateUserToken(conf.ACLToken, token.TokenSourceConfig)
+	}
+
+	if persistedTokens.Agent != "" {
+		a.tokens.UpdateAgentToken(persistedTokens.Agent, token.TokenSourceAPI)
+
+		if conf.ACLAgentToken != "" {
+			a.logger.Printf("[WARN] \"agent\" token present in both the configuration and persisted token store, using the persisted token")
+		}
+	} else {
+		a.tokens.UpdateAgentToken(conf.ACLAgentToken, token.TokenSourceConfig)
+	}
+
+	if persistedTokens.AgentMaster != "" {
+		a.tokens.UpdateAgentMasterToken(persistedTokens.AgentMaster, token.TokenSourceAPI)
+
+		if conf.ACLAgentMasterToken != "" {
+			a.logger.Printf("[WARN] \"agent_master\" token present in both the configuration and persisted token store, using the persisted token")
+		}
+	} else {
+		a.tokens.UpdateAgentMasterToken(conf.ACLAgentMasterToken, token.TokenSourceConfig)
+	}
+
+	if persistedTokens.Replication != "" {
+		a.tokens.UpdateReplicationToken(persistedTokens.Replication, token.TokenSourceAPI)
+
+		if conf.ACLReplicationToken != "" {
+			a.logger.Printf("[WARN] \"replication\" token present in both the configuration and persisted token store, using the persisted token")
+		}
+	} else {
+		a.tokens.UpdateReplicationToken(conf.ACLReplicationToken, token.TokenSourceConfig)
 	}
 
 	return persistenceErr
-}
-
-// unloadProxies will deregister all proxies known to the local agent.
-func (a *Agent) unloadProxies() error {
-	a.proxyLock.Lock()
-	defer a.proxyLock.Unlock()
-	for id := range a.State.Proxies() {
-		if err := a.removeProxyLocked(id, false); err != nil {
-			return fmt.Errorf("Failed deregistering proxy '%s': %s", id, err)
-		}
-	}
-	return nil
 }
 
 // snapshotCheckState is used to snapshot the current state of the health
@@ -3214,15 +3121,6 @@ func (a *Agent) unloadProxies() error {
 // restore into the same state.
 func (a *Agent) snapshotCheckState() map[types.CheckID]*structs.HealthCheck {
 	return a.State.Checks()
-}
-
-// restoreCheckState is used to reset the health state based on a snapshot.
-// This is done after we finish the reload to avoid any unnecessary flaps
-// in health state and potential session invalidations.
-func (a *Agent) restoreCheckState(snap map[types.CheckID]*structs.HealthCheck) {
-	for id, check := range snap {
-		a.State.UpdateCheck(id, check.Status, check.Output)
-	}
 }
 
 // loadMetadata loads node metadata fields from the agent config and
@@ -3344,15 +3242,15 @@ func (a *Agent) ReloadConfig(newCfg *config.RuntimeConfig) error {
 	a.PauseSync()
 	defer a.ResumeSync()
 
-	// Snapshot the current state, and restore it afterwards
+	a.stateLock.Lock()
+	defer a.stateLock.Unlock()
+
+	// Snapshot the current state, and use that to initialize the checks when
+	// they are recreated.
 	snap := a.snapshotCheckState()
-	defer a.restoreCheckState(snap)
 
 	// First unload all checks, services, and metadata. This lets us begin the reload
 	// with a clean slate.
-	if err := a.unloadProxies(); err != nil {
-		return fmt.Errorf("Failed unloading proxies: %s", err)
-	}
 	if err := a.unloadServices(); err != nil {
 		return fmt.Errorf("Failed unloading services: %s", err)
 	}
@@ -3361,14 +3259,20 @@ func (a *Agent) ReloadConfig(newCfg *config.RuntimeConfig) error {
 	}
 	a.unloadMetadata()
 
+	// Reload tokens - should be done before all the other loading
+	// to ensure the correct tokens are available for attaching to
+	// the checks and service registrations.
+	a.loadTokens(newCfg)
+
+	if err := a.tlsConfigurator.Update(newCfg.ToTLSUtilConfig()); err != nil {
+		return fmt.Errorf("Failed reloading tls configuration: %s", err)
+	}
+
 	// Reload service/check definitions and metadata.
 	if err := a.loadServices(newCfg); err != nil {
 		return fmt.Errorf("Failed reloading services: %s", err)
 	}
-	if err := a.loadProxies(newCfg); err != nil {
-		return fmt.Errorf("Failed reloading proxies: %s", err)
-	}
-	if err := a.loadChecks(newCfg); err != nil {
+	if err := a.loadChecks(newCfg, snap); err != nil {
 		return fmt.Errorf("Failed reloading checks: %s", err)
 	}
 	if err := a.loadMetadata(newCfg); err != nil {
@@ -3380,6 +3284,18 @@ func (a *Agent) ReloadConfig(newCfg *config.RuntimeConfig) error {
 	}
 
 	a.loadLimits(newCfg)
+
+	for _, s := range a.dnsServers {
+		if err := s.ReloadConfig(newCfg); err != nil {
+			return fmt.Errorf("Failed reloading dns config : %v", err)
+		}
+	}
+
+	// this only gets used by the consulConfig function and since
+	// that is only ever done during init and reload here then
+	// an in place modification is safe as reloads cannot be
+	// concurrent due to both gaing a full lock on the stateLock
+	a.config.ConfigEntryBootstrap = newCfg.ConfigEntryBootstrap
 
 	// create the config for the rpc server/client
 	consulCfg, err := a.consulConfig()
@@ -3463,22 +3379,62 @@ func (a *Agent) registerCache() {
 		// Prepared queries don't support blocking
 		Refresh: false,
 	})
-}
 
-// defaultProxyCommand returns the default Connect managed proxy command.
-func defaultProxyCommand(agentCfg *config.RuntimeConfig) ([]string, error) {
-	// Get the path to the current exectuable. This is cached once by the
-	// library so this is effectively just a variable read.
-	execPath, err := os.Executable()
-	if err != nil {
-		return nil, err
-	}
+	a.cache.RegisterType(cachetype.NodeServicesName, &cachetype.NodeServices{
+		RPC: a,
+	}, &cache.RegisterOptions{
+		// Maintain a blocking query, retry dropped connections quickly
+		Refresh:        true,
+		RefreshTimer:   0 * time.Second,
+		RefreshTimeout: 10 * time.Minute,
+	})
 
-	// "consul connect proxy" default value for managed daemon proxy
-	cmd := []string{execPath, "connect", "proxy"}
+	a.cache.RegisterType(cachetype.ResolvedServiceConfigName, &cachetype.ResolvedServiceConfig{
+		RPC: a,
+	}, &cache.RegisterOptions{
+		// Maintain a blocking query, retry dropped connections quickly
+		Refresh:        true,
+		RefreshTimer:   0 * time.Second,
+		RefreshTimeout: 10 * time.Minute,
+	})
 
-	if agentCfg != nil && agentCfg.LogLevel != "INFO" {
-		cmd = append(cmd, "-log-level", agentCfg.LogLevel)
-	}
-	return cmd, nil
+	a.cache.RegisterType(cachetype.CatalogListServicesName, &cachetype.CatalogListServices{
+		RPC: a,
+	}, &cache.RegisterOptions{
+		Refresh:        true,
+		RefreshTimer:   0 * time.Second,
+		RefreshTimeout: 10 * time.Minute,
+	})
+
+	a.cache.RegisterType(cachetype.CatalogDatacentersName, &cachetype.CatalogDatacenters{
+		RPC: a,
+	}, &cache.RegisterOptions{
+		Refresh: false,
+	})
+
+	a.cache.RegisterType(cachetype.InternalServiceDumpName, &cachetype.InternalServiceDump{
+		RPC: a,
+	}, &cache.RegisterOptions{
+		Refresh:        true,
+		RefreshTimer:   0 * time.Second,
+		RefreshTimeout: 10 * time.Minute,
+	})
+
+	a.cache.RegisterType(cachetype.CompiledDiscoveryChainName, &cachetype.CompiledDiscoveryChain{
+		RPC: a,
+	}, &cache.RegisterOptions{
+		// Maintain a blocking query, retry dropped connections quickly
+		Refresh:        true,
+		RefreshTimer:   0 * time.Second,
+		RefreshTimeout: 10 * time.Minute,
+	})
+
+	a.cache.RegisterType(cachetype.ConfigEntriesName, &cachetype.ConfigEntries{
+		RPC: a,
+	}, &cache.RegisterOptions{
+		// Maintain a blocking query, retry dropped connections quickly
+		Refresh:        true,
+		RefreshTimer:   0 * time.Second,
+		RefreshTimeout: 10 * time.Minute,
+	})
 }

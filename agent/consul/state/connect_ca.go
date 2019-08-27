@@ -11,6 +11,7 @@ const (
 	caBuiltinProviderTableName = "connect-ca-builtin"
 	caConfigTableName          = "connect-ca-config"
 	caRootTableName            = "connect-ca-roots"
+	caLeafIndexName            = "connect-ca-leaf-certs"
 )
 
 // caBuiltinProviderTableSchema returns a new table schema used for storing
@@ -107,15 +108,21 @@ func (s *Restore) CAConfig(config *structs.CAConfiguration) error {
 }
 
 // CAConfig is used to get the current CA configuration.
-func (s *Store) CAConfig() (uint64, *structs.CAConfiguration, error) {
+func (s *Store) CAConfig(ws memdb.WatchSet) (uint64, *structs.CAConfiguration, error) {
 	tx := s.db.Txn(false)
 	defer tx.Abort()
 
+	return s.caConfigTxn(tx, ws)
+}
+
+func (s *Store) caConfigTxn(tx *memdb.Txn, ws memdb.WatchSet) (uint64, *structs.CAConfiguration, error) {
 	// Get the CA config
-	c, err := tx.First(caConfigTableName, "id")
+	ch, c, err := tx.FirstWatch(caConfigTableName, "id")
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed CA config lookup: %s", err)
 	}
+
+	ws.Add(ch)
 
 	config, ok := c.(*structs.CAConfiguration)
 	if !ok {
@@ -155,7 +162,7 @@ func (s *Store) CACheckAndSetConfig(idx, cidx uint64, config *structs.CAConfigur
 	// index arg, then we shouldn't update anything and can safely
 	// return early here.
 	e, ok := existing.(*structs.CAConfiguration)
-	if !ok || e.ModifyIndex != cidx {
+	if (ok && e.ModifyIndex != cidx) || (!ok && cidx != 0) {
 		return false, nil
 	}
 
@@ -173,7 +180,6 @@ func (s *Store) caSetConfigTxn(idx uint64, tx *memdb.Txn, config *structs.CAConf
 	if err != nil {
 		return fmt.Errorf("failed CA config lookup: %s", err)
 	}
-
 	// Set the indexes, prevent the cluster ID from changing.
 	if prev != nil {
 		existing := prev.(*structs.CAConfiguration)
@@ -227,6 +233,10 @@ func (s *Store) CARoots(ws memdb.WatchSet) (uint64, structs.CARoots, error) {
 	tx := s.db.Txn(false)
 	defer tx.Abort()
 
+	return s.caRootsTxn(tx, ws)
+}
+
+func (s *Store) caRootsTxn(tx *memdb.Txn, ws memdb.WatchSet) (uint64, structs.CARoots, error) {
 	// Get the index
 	idx := maxIndexTxn(tx, caRootTableName)
 
@@ -442,4 +452,33 @@ func (s *Store) CADeleteProviderState(id string) error {
 	tx.Commit()
 
 	return nil
+}
+
+func (s *Store) CALeafSetIndex(index uint64) error {
+	tx := s.db.Txn(true)
+	defer tx.Abort()
+
+	return indexUpdateMaxTxn(tx, index, caLeafIndexName)
+}
+
+func (s *Store) CARootsAndConfig(ws memdb.WatchSet) (uint64, structs.CARoots, *structs.CAConfiguration, error) {
+	tx := s.db.Txn(false)
+	defer tx.Abort()
+
+	confIdx, config, err := s.caConfigTxn(tx, ws)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("failed CA config lookup: %v", err)
+	}
+
+	rootsIdx, roots, err := s.caRootsTxn(tx, ws)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("failed CA roots lookup: %v", err)
+	}
+
+	idx := rootsIdx
+	if confIdx > idx {
+		idx = confIdx
+	}
+
+	return idx, roots, config, nil
 }

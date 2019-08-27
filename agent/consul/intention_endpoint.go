@@ -29,6 +29,12 @@ type Intention struct {
 func (s *Intention) Apply(
 	args *structs.IntentionRequest,
 	reply *string) error {
+
+	// Forward this request to the primary DC if we're a secondary that's replicating intentions.
+	if s.srv.intentionReplicationEnabled() {
+		args.Datacenter = s.srv.config.PrimaryDatacenter
+	}
+
 	if done, err := s.srv.forward("Intention.Apply", args, args, reply); done {
 		return err
 	}
@@ -134,6 +140,9 @@ func (s *Intention) Apply(
 			return err
 		}
 	}
+
+	// make sure we set the hash prior to raft application
+	args.Intention.SetHash(true)
 
 	// Commit
 	resp, err := s.srv.raftApply(structs.IntentionRequestType, args)

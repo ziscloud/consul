@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/hashicorp/consul/connect"
 	"log"
 	"net"
 	"os"
@@ -15,8 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	agConnect "github.com/hashicorp/consul/agent/connect"
-	"github.com/hashicorp/consul/connect"
-	"github.com/hashicorp/consul/lib/freeport"
+	"github.com/hashicorp/consul/ipaddr"
+	"github.com/hashicorp/consul/sdk/freeport"
 )
 
 func testSetupMetrics(t *testing.T) *metrics.InmemSink {
@@ -204,7 +205,7 @@ func TestUpstreamListener(t *testing.T) {
 	// Proxy and fake remote service are running, play the part of the app
 	// connecting to a remote connect service over TCP.
 	conn, err := net.Dial("tcp",
-		fmt.Sprintf("%s:%d", cfg.LocalBindAddress, cfg.LocalBindPort))
+		ipaddr.FormatAddressPort(cfg.LocalBindAddress, cfg.LocalBindPort))
 	require.NoError(t, err)
 
 	TestEchoConn(t, conn, "")

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,11 +17,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var vaultLock sync.Mutex
+
 func testVaultCluster(t *testing.T) (*VaultProvider, *vault.Core, net.Listener) {
 	return testVaultClusterWithConfig(t, true, nil)
 }
 
 func testVaultClusterWithConfig(t *testing.T, isRoot bool, rawConf map[string]interface{}) (*VaultProvider, *vault.Core, net.Listener) {
+	vaultLock.Lock()
+	defer vaultLock.Unlock()
+
 	if err := vault.AddTestLogicalBackend("pki", pki.Factory); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +186,7 @@ func TestVaultCAProvider_SignLeaf(t *testing.T) {
 		require.NotEqual(firstSerial, parsed.SerialNumber.Uint64())
 
 		// Ensure the cert is valid now and expires within the correct limit.
-		require.True(parsed.NotAfter.Sub(time.Now()) < time.Hour)
+		require.True(time.Until(parsed.NotAfter) < time.Hour)
 		require.True(parsed.NotBefore.Before(time.Now()))
 	}
 }

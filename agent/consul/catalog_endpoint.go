@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/ipaddr"
 	"github.com/hashicorp/consul/types"
+	bexpr "github.com/hashicorp/go-bexpr"
 	"github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/go-uuid"
 )
@@ -20,6 +21,72 @@ type Catalog struct {
 	srv *Server
 }
 
+// nodePreApply does the verification of a node before it is applied to Raft.
+func nodePreApply(nodeName, nodeID string) error {
+	if nodeName == "" {
+		return fmt.Errorf("Must provide node")
+	}
+	if nodeID != "" {
+		if _, err := uuid.ParseUUID(nodeID); err != nil {
+			return fmt.Errorf("Bad node ID: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func servicePreApply(service *structs.NodeService, rule acl.Authorizer) error {
+	// Validate the service. This is in addition to the below since
+	// the above just hasn't been moved over yet. We should move it over
+	// in time.
+	if err := service.Validate(); err != nil {
+		return err
+	}
+
+	// If no service id, but service name, use default
+	if service.ID == "" && service.Service != "" {
+		service.ID = service.Service
+	}
+
+	// Verify ServiceName provided if ID.
+	if service.ID != "" && service.Service == "" {
+		return fmt.Errorf("Must provide service name with ID")
+	}
+
+	// Check the service address here and in the agent endpoint
+	// since service registration isn't synchronous.
+	if ipaddr.IsAny(service.Address) {
+		return fmt.Errorf("Invalid service address")
+	}
+
+	// Apply the ACL policy if any. The 'consul' service is excluded
+	// since it is managed automatically internally (that behavior
+	// is going away after version 0.8). We check this same policy
+	// later if version 0.8 is enabled, so we can eventually just
+	// delete this and do all the ACL checks down there.
+	if service.Service != structs.ConsulServiceName {
+		if rule != nil && !rule.ServiceWrite(service.Service, nil) {
+			return acl.ErrPermissionDenied
+		}
+	}
+
+	// Proxies must have write permission on their destination
+	if service.Kind == structs.ServiceKindConnectProxy {
+		if rule != nil && !rule.ServiceWrite(service.Proxy.DestinationServiceName, nil) {
+			return acl.ErrPermissionDenied
+		}
+	}
+
+	return nil
+}
+
+// checkPreApply does the verification of a check before it is applied to Raft.
+func checkPreApply(check *structs.HealthCheck) {
+	if check.CheckID == "" && check.Name != "" {
+		check.CheckID = types.CheckID(check.Name)
+	}
+}
+
 // Register is used register that a node is providing a given service.
 func (c *Catalog) Register(args *structs.RegisterRequest, reply *struct{}) error {
 	if done, err := c.srv.forward("Catalog.Register", args, args, reply); done {
@@ -27,66 +94,24 @@ func (c *Catalog) Register(args *structs.RegisterRequest, reply *struct{}) error
 	}
 	defer metrics.MeasureSince([]string{"catalog", "register"}, time.Now())
 
-	// Verify the args.
-	if args.Node == "" {
-		return fmt.Errorf("Must provide node")
-	}
-	if args.Address == "" && !args.SkipNodeUpdate {
-		return fmt.Errorf("Must provide address if SkipNodeUpdate is not set")
-	}
-	if args.ID != "" {
-		if _, err := uuid.ParseUUID(string(args.ID)); err != nil {
-			return fmt.Errorf("Bad node ID: %v", err)
-		}
-	}
-
 	// Fetch the ACL token, if any.
 	rule, err := c.srv.ResolveToken(args.Token)
 	if err != nil {
 		return err
 	}
 
+	// Verify the args.
+	if err := nodePreApply(args.Node, string(args.ID)); err != nil {
+		return err
+	}
+	if args.Address == "" && !args.SkipNodeUpdate {
+		return fmt.Errorf("Must provide address if SkipNodeUpdate is not set")
+	}
+
 	// Handle a service registration.
 	if args.Service != nil {
-		// Validate the service. This is in addition to the below since
-		// the above just hasn't been moved over yet. We should move it over
-		// in time.
-		if err := args.Service.Validate(); err != nil {
+		if err := servicePreApply(args.Service, rule); err != nil {
 			return err
-		}
-
-		// If no service id, but service name, use default
-		if args.Service.ID == "" && args.Service.Service != "" {
-			args.Service.ID = args.Service.Service
-		}
-
-		// Verify ServiceName provided if ID.
-		if args.Service.ID != "" && args.Service.Service == "" {
-			return fmt.Errorf("Must provide service name with ID")
-		}
-
-		// Check the service address here and in the agent endpoint
-		// since service registration isn't synchronous.
-		if ipaddr.IsAny(args.Service.Address) {
-			return fmt.Errorf("Invalid service address")
-		}
-
-		// Apply the ACL policy if any. The 'consul' service is excluded
-		// since it is managed automatically internally (that behavior
-		// is going away after version 0.8). We check this same policy
-		// later if version 0.8 is enabled, so we can eventually just
-		// delete this and do all the ACL checks down there.
-		if args.Service.Service != structs.ConsulServiceName {
-			if rule != nil && !rule.ServiceWrite(args.Service.Service, nil) {
-				return acl.ErrPermissionDenied
-			}
-		}
-
-		// Proxies must have write permission on their destination
-		if args.Service.Kind == structs.ServiceKindConnectProxy {
-			if rule != nil && !rule.ServiceWrite(args.Service.Proxy.DestinationServiceName, nil) {
-				return acl.ErrPermissionDenied
-			}
 		}
 	}
 
@@ -96,12 +121,10 @@ func (c *Catalog) Register(args *structs.RegisterRequest, reply *struct{}) error
 		args.Check = nil
 	}
 	for _, check := range args.Checks {
-		if check.CheckID == "" && check.Name != "" {
-			check.CheckID = types.CheckID(check.Name)
-		}
 		if check.Node == "" {
 			check.Node = args.Node
 		}
+		checkPreApply(check)
 	}
 
 	// Check the complete register request against the given ACL policy.
@@ -177,7 +200,7 @@ func (c *Catalog) Deregister(args *structs.DeregisterRequest, reply *struct{}) e
 }
 
 // ListDatacenters is used to query for the list of known datacenters
-func (c *Catalog) ListDatacenters(args *struct{}, reply *[]string) error {
+func (c *Catalog) ListDatacenters(args *structs.DatacentersRequest, reply *[]string) error {
 	dcs, err := c.srv.router.GetDatacentersByDistance()
 	if err != nil {
 		return err
@@ -194,6 +217,11 @@ func (c *Catalog) ListDatacenters(args *struct{}, reply *[]string) error {
 // ListNodes is used to query the nodes in a DC
 func (c *Catalog) ListNodes(args *structs.DCSpecificRequest, reply *structs.IndexedNodes) error {
 	if done, err := c.srv.forward("Catalog.ListNodes", args, args, reply); done {
+		return err
+	}
+
+	filter, err := bexpr.CreateFilter(args.Filter, nil, reply.Nodes)
+	if err != nil {
 		return err
 	}
 
@@ -217,6 +245,13 @@ func (c *Catalog) ListNodes(args *structs.DCSpecificRequest, reply *structs.Inde
 			if err := c.srv.filterACL(args.Token, reply); err != nil {
 				return err
 			}
+
+			raw, err := filter.Execute(reply.Nodes)
+			if err != nil {
+				return err
+			}
+			reply.Nodes = raw.(structs.Nodes)
+
 			return c.srv.sortNodesByDistanceFrom(args.Source, reply.Nodes)
 		})
 }
@@ -305,7 +340,12 @@ func (c *Catalog) ServiceNodes(args *structs.ServiceSpecificRequest, reply *stru
 		}
 	}
 
-	err := c.srv.blockingQuery(
+	filter, err := bexpr.CreateFilter(args.Filter, nil, reply.ServiceNodes)
+	if err != nil {
+		return err
+	}
+
+	err = c.srv.blockingQuery(
 		&args.QueryOptions,
 		&reply.QueryMeta,
 		func(ws memdb.WatchSet, state *state.Store) error {
@@ -324,9 +364,19 @@ func (c *Catalog) ServiceNodes(args *structs.ServiceSpecificRequest, reply *stru
 				}
 				reply.ServiceNodes = filtered
 			}
+
 			if err := c.srv.filterACL(args.Token, reply); err != nil {
 				return err
 			}
+
+			// This is safe to do even when the filter is nil - its just a no-op then
+			raw, err := filter.Execute(reply.ServiceNodes)
+			if err != nil {
+				return err
+			}
+
+			reply.ServiceNodes = raw.(structs.ServiceNodes)
+
 			return c.srv.sortNodesByDistanceFrom(args.Source, reply.ServiceNodes)
 		})
 
@@ -378,6 +428,12 @@ func (c *Catalog) NodeServices(args *structs.NodeSpecificRequest, reply *structs
 		return fmt.Errorf("Must provide node")
 	}
 
+	var filterType map[string]*structs.NodeService
+	filter, err := bexpr.CreateFilter(args.Filter, nil, filterType)
+	if err != nil {
+		return err
+	}
+
 	return c.srv.blockingQuery(
 		&args.QueryOptions,
 		&reply.QueryMeta,
@@ -388,6 +444,18 @@ func (c *Catalog) NodeServices(args *structs.NodeSpecificRequest, reply *structs
 			}
 
 			reply.Index, reply.NodeServices = index, services
-			return c.srv.filterACL(args.Token, reply)
+			if err := c.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+
+			if reply.NodeServices != nil {
+				raw, err := filter.Execute(reply.NodeServices.Services)
+				if err != nil {
+					return err
+				}
+				reply.NodeServices.Services = raw.(map[string]*structs.NodeService)
+			}
+
+			return nil
 		})
 }

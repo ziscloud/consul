@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/hashicorp/consul/agent/checks"
 	"github.com/hashicorp/consul/agent/consul"
 	"github.com/hashicorp/consul/version"
+	"github.com/hashicorp/raft"
 )
 
 func DefaultRPCProtocol() (int, error) {
@@ -49,6 +51,7 @@ func DefaultSource() Source {
 		bind_addr = "0.0.0.0"
 		bootstrap = false
 		bootstrap_expect = 0
+		check_output_max_size = ` + strconv.Itoa(checks.DefaultBufSize) + `
 		check_update_interval = "5m"
 		client_addr = "127.0.0.1"
 		datacenter = "` + consul.DefaultDC + `"
@@ -64,7 +67,7 @@ func DefaultSource() Source {
 		retry_interval_wan = "30s"
 		server = false
 		syslog_facility = "LOCAL0"
-		tls_min_version = "tls10"
+		tls_min_version = "tls12"
 
 		// TODO (slackpad) - Until #3744 is done, we need to keep these
 		// in sync with agent/consul/config.go.
@@ -100,6 +103,7 @@ func DefaultSource() Source {
 		limits = {
 			rpc_rate = -1
 			rpc_max_burst = 1000
+			kv_max_value_size = ` + strconv.FormatInt(raft.SuggestedMaxDataSize, 10) + `
 		}
 		performance = {
 			leave_drain_time = "5s"

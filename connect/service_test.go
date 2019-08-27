@@ -18,8 +18,8 @@ import (
 	"github.com/hashicorp/consul/agent"
 	"github.com/hashicorp/consul/agent/connect"
 	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/sdk/testutil/retry"
 	"github.com/hashicorp/consul/testrpc"
-	"github.com/hashicorp/consul/testutil/retry"
 	"github.com/stretchr/testify/require"
 )
 
@@ -127,7 +127,7 @@ func TestService_Dial(t *testing.T) {
 func TestService_ServerTLSConfig(t *testing.T) {
 	require := require.New(t)
 
-	a := agent.NewTestAgent("007", "")
+	a := agent.NewTestAgent(t, "007", "")
 	defer a.Shutdown()
 	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 	client := a.Client()
@@ -135,7 +135,7 @@ func TestService_ServerTLSConfig(t *testing.T) {
 
 	// NewTestAgent setup a CA already by default
 
-	// Register a local agent service with a managed proxy
+	// Register a local agent service
 	reg := &api.AgentServiceRegistration{
 		Name: "web",
 		Port: 8080,

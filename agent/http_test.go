@@ -19,9 +19,10 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/agent/structs"
+	tokenStore "github.com/hashicorp/consul/agent/token"
 	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/sdk/testutil"
 	"github.com/hashicorp/consul/testrpc"
-	"github.com/hashicorp/consul/testutil"
 	cleanhttp "github.com/hashicorp/go-cleanhttp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,7 +41,7 @@ func TestHTTPServer_UnixSocket(t *testing.T) {
 
 	// Only testing mode, since uid/gid might not be settable
 	// from test environment.
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 		addresses {
 			http = "unix://`+socket+`"
 		}
@@ -109,7 +110,7 @@ func TestHTTPServer_UnixSocket_FileExists(t *testing.T) {
 		t.Fatalf("not a regular file: %s", socket)
 	}
 
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 		addresses {
 			http = "unix://`+socket+`"
 		}
@@ -139,7 +140,7 @@ func TestHTTPServer_H2(t *testing.T) {
 			ca_file = "../test/client_certs/rootca.crt"
 		`,
 	}
-	a.Start()
+	a.Start(t)
 	defer a.Shutdown()
 
 	// Make an HTTP/2-enabled client, using the API helpers to set
@@ -286,7 +287,7 @@ func TestSetMeta(t *testing.T) {
 func TestHTTPAPI_BlockEndpoints(t *testing.T) {
 	t.Parallel()
 
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 		http_config {
 			block_endpoints = ["/v1/agent/self"]
 		}
@@ -319,10 +320,17 @@ func TestHTTPAPI_BlockEndpoints(t *testing.T) {
 }
 
 func TestHTTPAPI_Ban_Nonprintable_Characters(t *testing.T) {
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
-	req, _ := http.NewRequest("GET", "/v1/kv/bad\x00ness", nil)
+	req, err := http.NewRequest("GET", "/v1/kv/bad\x00ness", nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	req, err = http.NewRequest("GET", "/v1/kv/bad%00ness", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	resp := httptest.NewRecorder()
 	a.srv.Handler.ServeHTTP(resp, req)
 	if got, want := resp.Code, http.StatusBadRequest; got != want {
@@ -331,10 +339,17 @@ func TestHTTPAPI_Ban_Nonprintable_Characters(t *testing.T) {
 }
 
 func TestHTTPAPI_Allow_Nonprintable_Characters_With_Flag(t *testing.T) {
-	a := NewTestAgent(t.Name(), "disable_http_unprintable_char_filter = true")
+	a := NewTestAgent(t, t.Name(), "disable_http_unprintable_char_filter = true")
 	defer a.Shutdown()
 
-	req, _ := http.NewRequest("GET", "/v1/kv/bad\x00ness", nil)
+	req, err := http.NewRequest("GET", "/v1/kv/bad\x00ness", nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	req, err = http.NewRequest("GET", "/v1/kv/bad%00ness", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	resp := httptest.NewRecorder()
 	a.srv.Handler.ServeHTTP(resp, req)
 	// Key doesn't actually exist so we should get 404
@@ -347,7 +362,7 @@ func TestHTTPAPI_TranslateAddrHeader(t *testing.T) {
 	t.Parallel()
 	// Header should not be present if address translation is off.
 	{
-		a := NewTestAgent(t.Name(), "")
+		a := NewTestAgent(t, t.Name(), "")
 		defer a.Shutdown()
 
 		resp := httptest.NewRecorder()
@@ -366,7 +381,7 @@ func TestHTTPAPI_TranslateAddrHeader(t *testing.T) {
 
 	// Header should be set to true if it's turned on.
 	{
-		a := NewTestAgent(t.Name(), `
+		a := NewTestAgent(t, t.Name(), `
 			translate_wan_addrs = true
 		`)
 		defer a.Shutdown()
@@ -388,7 +403,7 @@ func TestHTTPAPI_TranslateAddrHeader(t *testing.T) {
 
 func TestHTTPAPIResponseHeaders(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 		http_config {
 			response_headers = {
 				"Access-Control-Allow-Origin" = "*"
@@ -419,7 +434,7 @@ func TestHTTPAPIResponseHeaders(t *testing.T) {
 
 func TestContentTypeIsJSON(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	resp := httptest.NewRecorder()
@@ -442,7 +457,7 @@ func TestHTTP_wrap_obfuscateLog(t *testing.T) {
 	t.Parallel()
 	buf := new(bytes.Buffer)
 	a := &TestAgent{Name: t.Name(), LogOutput: buf}
-	a.Start()
+	a.Start(t)
 	defer a.Shutdown()
 
 	handler := func(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
@@ -503,7 +518,7 @@ func TestPrettyPrintBare(t *testing.T) {
 }
 
 func testPrettyPrint(pretty string, t *testing.T) {
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	r := &structs.DirEntry{Key: "key"}
@@ -531,7 +546,7 @@ func testPrettyPrint(pretty string, t *testing.T) {
 
 func TestParseSource(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	// Default is agent's DC and no node (since the user didn't care, then
@@ -729,7 +744,7 @@ func TestParseWait(t *testing.T) {
 func TestPProfHandlers_EnableDebug(t *testing.T) {
 	t.Parallel()
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "enable_debug = true")
+	a := NewTestAgent(t, t.Name(), "enable_debug = true")
 	defer a.Shutdown()
 
 	resp := httptest.NewRecorder()
@@ -742,7 +757,7 @@ func TestPProfHandlers_EnableDebug(t *testing.T) {
 func TestPProfHandlers_DisableDebugNoACLs(t *testing.T) {
 	t.Parallel()
 	require := require.New(t)
-	a := NewTestAgent(t.Name(), "enable_debug = false")
+	a := NewTestAgent(t, t.Name(), "enable_debug = false")
 	defer a.Shutdown()
 
 	resp := httptest.NewRecorder()
@@ -758,7 +773,7 @@ func TestPProfHandlers_ACLs(t *testing.T) {
 	assert := assert.New(t)
 	dc1 := "dc1"
 
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 	acl_datacenter = "`+dc1+`"
 	acl_default_policy = "deny"
 	acl_master_token = "master"
@@ -861,7 +876,7 @@ func TestParseConsistency(t *testing.T) {
 	var b structs.QueryOptions
 
 	req, _ := http.NewRequest("GET", "/v1/catalog/nodes?stale", nil)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	if d := a.srv.parseConsistency(resp, req, &b); d {
 		t.Fatalf("unexpected done")
@@ -913,7 +928,7 @@ func ensureConsistency(t *testing.T, a *TestAgent, path string, maxStale time.Du
 }
 
 func TestParseConsistencyAndMaxStale(t *testing.T) {
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	// Default => Consistent
@@ -949,7 +964,7 @@ func TestParseConsistency_Invalid(t *testing.T) {
 	var b structs.QueryOptions
 
 	req, _ := http.NewRequest("GET", "/v1/catalog/nodes?stale&consistent", nil)
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 	if d := a.srv.parseConsistency(resp, req, &b); !d {
 		t.Fatalf("expected done")
@@ -1010,18 +1025,18 @@ func TestACLResolution(t *testing.T) {
 	reqAuthBearerAndXToken.Header.Add("X-Consul-Token", "xtoken")
 	reqAuthBearerAndXToken.Header.Add("Authorization", "Bearer bearer-token")
 
-	a := NewTestAgent(t.Name(), "")
+	a := NewTestAgent(t, t.Name(), "")
 	defer a.Shutdown()
 
 	// Check when no token is set
-	a.tokens.UpdateUserToken("")
+	a.tokens.UpdateUserToken("", tokenStore.TokenSourceConfig)
 	a.srv.parseToken(req, &token)
 	if token != "" {
 		t.Fatalf("bad: %s", token)
 	}
 
 	// Check when ACLToken set
-	a.tokens.UpdateUserToken("agent")
+	a.tokens.UpdateUserToken("agent", tokenStore.TokenSourceAPI)
 	a.srv.parseToken(req, &token)
 	if token != "agent" {
 		t.Fatalf("bad: %s", token)
@@ -1100,7 +1115,7 @@ func TestACLResolution(t *testing.T) {
 
 func TestEnableWebUI(t *testing.T) {
 	t.Parallel()
-	a := NewTestAgent(t.Name(), `
+	a := NewTestAgent(t, t.Name(), `
 		ui = true
 	`)
 	defer a.Shutdown()
@@ -1110,97 +1125,6 @@ func TestEnableWebUI(t *testing.T) {
 	a.srv.Handler.ServeHTTP(resp, req)
 	if resp.Code != 200 {
 		t.Fatalf("should handle ui")
-	}
-}
-
-func TestParseToken_ProxyTokenResolve(t *testing.T) {
-	t.Parallel()
-
-	type endpointCheck struct {
-		endpoint string
-		handler  func(s *HTTPServer, resp http.ResponseWriter, req *http.Request) (interface{}, error)
-	}
-
-	// This is not an exhaustive list of all of our endpoints and is only testing GET endpoints
-	// right now. However it provides decent coverage that the proxy token resolution
-	// is happening properly
-	tests := []endpointCheck{
-		{"/v1/acl/info/root", (*HTTPServer).ACLGet},
-		{"/v1/agent/self", (*HTTPServer).AgentSelf},
-		{"/v1/agent/metrics", (*HTTPServer).AgentMetrics},
-		{"/v1/agent/services", (*HTTPServer).AgentServices},
-		{"/v1/agent/checks", (*HTTPServer).AgentChecks},
-		{"/v1/agent/members", (*HTTPServer).AgentMembers},
-		{"/v1/agent/connect/ca/roots", (*HTTPServer).AgentConnectCARoots},
-		{"/v1/agent/connect/ca/leaf/test", (*HTTPServer).AgentConnectCALeafCert},
-		{"/v1/agent/connect/ca/proxy/test", (*HTTPServer).AgentConnectProxyConfig},
-		{"/v1/catalog/connect", (*HTTPServer).CatalogConnectServiceNodes},
-		{"/v1/catalog/datacenters", (*HTTPServer).CatalogDatacenters},
-		{"/v1/catalog/nodes", (*HTTPServer).CatalogNodes},
-		{"/v1/catalog/node/" + t.Name(), (*HTTPServer).CatalogNodeServices},
-		{"/v1/catalog/services", (*HTTPServer).CatalogServices},
-		{"/v1/catalog/service/test", (*HTTPServer).CatalogServiceNodes},
-		{"/v1/connect/ca/configuration", (*HTTPServer).ConnectCAConfiguration},
-		{"/v1/connect/ca/roots", (*HTTPServer).ConnectCARoots},
-		{"/v1/connect/intentions", (*HTTPServer).IntentionEndpoint},
-		{"/v1/coordinate/datacenters", (*HTTPServer).CoordinateDatacenters},
-		{"/v1/coordinate/nodes", (*HTTPServer).CoordinateNodes},
-		{"/v1/coordinate/node/" + t.Name(), (*HTTPServer).CoordinateNode},
-		{"/v1/event/list", (*HTTPServer).EventList},
-		{"/v1/health/node/" + t.Name(), (*HTTPServer).HealthNodeChecks},
-		{"/v1/health/checks/test", (*HTTPServer).HealthNodeChecks},
-		{"/v1/health/state/passing", (*HTTPServer).HealthChecksInState},
-		{"/v1/health/service/test", (*HTTPServer).HealthServiceNodes},
-		{"/v1/health/connect/test", (*HTTPServer).HealthConnectServiceNodes},
-		{"/v1/operator/raft/configuration", (*HTTPServer).OperatorRaftConfiguration},
-		// keyring endpoint has issues with returning errors if you haven't enabled encryption
-		// {"/v1/operator/keyring", (*HTTPServer).OperatorKeyringEndpoint},
-		{"/v1/operator/autopilot/configuration", (*HTTPServer).OperatorAutopilotConfiguration},
-		{"/v1/operator/autopilot/health", (*HTTPServer).OperatorServerHealth},
-		{"/v1/query", (*HTTPServer).PreparedQueryGeneral},
-		{"/v1/session/list", (*HTTPServer).SessionList},
-		{"/v1/status/leader", (*HTTPServer).StatusLeader},
-		{"/v1/status/peers", (*HTTPServer).StatusPeers},
-	}
-
-	a := NewTestAgent(t.Name(), TestACLConfig()+testAllowProxyConfig())
-	defer a.Shutdown()
-
-	// Register a service with a managed proxy
-	{
-		reg := &structs.ServiceDefinition{
-			ID:      "test-id",
-			Name:    "test",
-			Address: "127.0.0.1",
-			Port:    8000,
-			Check: structs.CheckType{
-				TTL: 15 * time.Second,
-			},
-			Connect: &structs.ServiceConnect{
-				Proxy: &structs.ServiceDefinitionConnectProxy{},
-			},
-		}
-
-		req, _ := http.NewRequest("PUT", "/v1/agent/service/register?token=root", jsonReader(reg))
-		resp := httptest.NewRecorder()
-		_, err := a.srv.AgentRegisterService(resp, req)
-		require.NoError(t, err)
-		require.Equal(t, 200, resp.Code, "body: %s", resp.Body.String())
-	}
-
-	// Get the proxy token from the agent directly, since there is no API.
-	proxy := a.State.Proxy("test-id-proxy")
-	require.NotNil(t, proxy)
-	token := proxy.ProxyToken
-	require.NotEmpty(t, token)
-
-	for _, check := range tests {
-		t.Run(fmt.Sprintf("GET(%s)", check.endpoint), func(t *testing.T) {
-			req, _ := http.NewRequest("GET", fmt.Sprintf("%s?token=%s", check.endpoint, token), nil)
-			resp := httptest.NewRecorder()
-			_, err := check.handler(a.srv, resp, req)
-			require.NoError(t, err)
-		})
 	}
 }
 
@@ -1268,7 +1192,7 @@ func TestAllowedNets(t *testing.T) {
 		a := &TestAgent{
 			Name: t.Name(),
 		}
-		a.Start()
+		a.Start(t)
 		defer a.Shutdown()
 		testrpc.WaitForTestAgent(t, a.RPC, "dc1")
 
